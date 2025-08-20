@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NetDash v1.3 (design preserved, ASCII-only)
-NEW:
-- History persistence: last MAX_POINTS samples are saved to disk and restored on restart.
-- No-store header to avoid stale JS cache.
-- Chart.js fallback remains; dark mode & filtering intact.
+NetDash v1.4.8
+- برچسب وضعیت UP از «بالاست» به «فعال» تغییر یافت
+- چیدمان LTR برای جلوگیری از برعکس شدن عناصر، برچسب‌ها فارسی
 """
 import os
 import time
@@ -13,14 +11,23 @@ import json
 import threading
 import subprocess
 from collections import deque, defaultdict
-from flask import Flask, jsonify, render_template_string, make_response
+from flask import Flask, jsonify, render_template_string, make_response, request, abort
+
+VERSION = "1.4.8"
 
 POLL_INTERVAL = 1.0   # seconds
-MAX_POINTS    = 120   # max points kept in each chart
+MAX_POINTS    = int(os.environ.get("NETDASH_MAX_POINTS", "120"))
 HOST          = "0.0.0.0"
-PORT          = 18080
+PORT          = int(os.environ.get("NETDASH_PORT", "18080"))
 
-# ----------------------- storage location helpers ----------------------
+# --- control config ---
+CONTROL_ENABLED = True
+CONTROL_TOKEN   = os.environ.get("NETDASH_TOKEN", "").strip()  # optional
+DENY_IFACES     = {x.strip() for x in os.environ.get("NETDASH_DENY", "").split(",") if x.strip()}
+ALLOW_IFACES    = {x.strip() for x in os.environ.get("NETDASH_ALLOW", "").split(",") if x.strip()}
+
+app = Flask(__name__)
+
 def _pick_data_home():
     candidates = [
         "/var/lib/netdash",
@@ -43,15 +50,21 @@ def _pick_data_home():
 DATA_HOME = _pick_data_home()
 HISTORY_FILE = os.path.join(DATA_HOME, "history.json")
 
-app = Flask(__name__)
-
-# ----------------------------- helpers ---------------------------------
 def _run_ip_json(args):
     try:
         out = subprocess.check_output(["ip"] + args, text=True)
         return json.loads(out)
     except Exception:
         return []
+
+def can_control(iface: str) -> bool:
+    if not CONTROL_ENABLED or not iface:
+        return False
+    if ALLOW_IFACES:
+        return iface in ALLOW_IFACES
+    if iface in DENY_IFACES:
+        return False
+    return True
 
 def get_interfaces_info():
     links = _run_ip_json(["-json", "link"])
@@ -63,9 +76,10 @@ def get_interfaces_info():
         li = by_index.get(idx, {})
         name = item.get("ifname") or li.get("ifname")
         flags = li.get("flags") or item.get("flags", [])
-        state = li.get("operstate") or item.get("operstate")
+        state = (li.get("operstate") or item.get("operstate") or "").upper()
         mtu = li.get("mtu") or item.get("mtu")
         mac = li.get("address") if li.get("link_type") != "none" else None
+        is_up = ("UP" in (flags or [])) or (state == "UP")
         addresses = []
         for a in item.get("addr_info", []):
             fam = a.get("family")
@@ -75,19 +89,26 @@ def get_interfaces_info():
             if local is not None and prefix is not None:
                 addresses.append({"family": fam, "cidr": f"{local}/{prefix}", "scope": scope})
         result.append({
-            "name": name, "ifindex": idx, "state": state, "flags": flags or [],
-            "mtu": mtu, "mac": mac, "addresses": addresses
+            "name": name, "ifindex": idx, "state": state or "UNKNOWN", "flags": flags or [],
+            "mtu": mtu, "mac": mac, "addresses": addresses,
+            "can_control": can_control(name), "is_up": is_up
         })
     for idx, li in by_index.items():
+        name = li.get("ifname")
         if not any(r["ifindex"] == idx for r in result):
+            flags = li.get("flags", [])
+            state = (li.get("operstate") or "").upper()
+            is_up = ("UP" in (flags or [])) or (state == "UP")
             result.append({
-                "name": li.get("ifname"),
+                "name": name,
                 "ifindex": idx,
-                "state": li.get("operstate"),
-                "flags": li.get("flags", []),
+                "state": state or "UNKNOWN",
+                "flags": flags,
                 "mtu": li.get("mtu"),
                 "mac": li.get("address"),
-                "addresses": []
+                "addresses": [],
+                "can_control": can_control(name),
+                "is_up": is_up
             })
     result = [r for r in result if r.get("name")]
     result.sort(key=lambda x: x["ifindex"] or 10**9)
@@ -109,12 +130,11 @@ def read_counters(iface):
             return 0
     return read_one("rx_bytes"), read_one("tx_bytes")
 
-# --------------------------- persistent history ------------------------
 class HistoryStore:
     def __init__(self, filepath, max_points=120):
         self.filepath = filepath
         self.max_points = max_points
-        self.hist = defaultdict(lambda: deque(maxlen=self.max_points))  # iface -> deque[(ts, rx_bps, tx_bps)]
+        self.hist = defaultdict(lambda: deque(maxlen=self.max_points))
         self.lock = threading.Lock()
         self._last_flush = 0.0
         self.flush_interval = 5.0
@@ -137,7 +157,6 @@ class HistoryStore:
         now = time.time()
         if not force and (now - self._last_flush) < self.flush_interval:
             return
-        data = None
         with self.lock:
             data = {iface: list(dq) for iface, dq in self.hist.items()}
         try:
@@ -170,7 +189,6 @@ class HistoryStore:
 history = HistoryStore(HISTORY_FILE, MAX_POINTS)
 history.load()
 
-# ------------------------------ monitor --------------------------------
 class NetMonitor:
     def __init__(self, poll_interval=1.0):
         self.poll = poll_interval
@@ -205,8 +223,7 @@ class NetMonitor:
             time.sleep(self.poll)
 
     def start(self):
-        if self.running:
-            return
+        if self.running: return
         self.running = True
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -217,29 +234,58 @@ class NetMonitor:
 monitor = NetMonitor(POLL_INTERVAL)
 monitor.start()
 
-# ------------------------------- ui html -------------------------------
+def _find_ip_binary():
+    for p in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "ip"):
+        if os.path.isabs(p) and os.path.exists(p):
+            return p
+    return "ip"
+
+def _require_token():
+    if CONTROL_TOKEN:
+        tok = request.headers.get("X-Auth-Token", "")
+        if tok != CONTROL_TOKEN:
+            abort(401, description="Invalid token")
+
+def iface_action(iface: str, action: str):
+    if not can_control(iface):
+        abort(403, description="Interface not permitted")
+    _require_token()
+    ipbin = _find_ip_binary()
+    cmd = [ipbin, "link", "set", "dev", iface, "down" if action=="down" else "up"]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    try:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+        return {"ok": True, "iface": iface, "action": action}
+    except subprocess.CalledProcessError as e:
+        return {"ok": False, "error": f"ip failed ({e})", "iface": iface, "action": action}, 500
+
 HTML = r"""
 <!doctype html>
-<html lang="en">
+<html lang="fa" dir="ltr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NetDash - Network Traffic Dashboard</title>
+  <title>NetDash - داشبورد ترافیک شبکه</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
-      theme: { extend: { fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui'] } } }
+      theme: { extend: { fontFamily: { sans: ['Vazirmatn', 'Inter', 'ui-sans-serif', 'system-ui'] } } }
     }
   </script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     .card { border-radius: 1rem; box-shadow: 0 2px 24px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.06); }
-    .k { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .k { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; direction:ltr }
     .badge { display:inline-flex; align-items:center; gap:.4rem; padding:.2rem .5rem; border-radius:999px; font-size:.75rem; font-weight:600; }
     .b-up { background:#d1fae5; color:#065f46; }
     .b-down { background:#fee2e2; color:#991b1b; }
     .b-unk { background:#fde68a; color:#92400e; }
+    .badge-btn { cursor:pointer; user-select:none; border: none; }
+    .badge-btn:disabled { opacity:.75; cursor:not-allowed; }
+    .ltr { direction:ltr }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
@@ -247,23 +293,23 @@ HTML = r"""
     <div class="flex flex-wrap items-center justify-between gap-3 mb-6">
       <h1 class="text-2xl sm:text-3xl font-extrabold">NetDash</h1>
       <div class="flex items-center gap-2">
-        <input id="filterInput" class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" placeholder="Filter interfaces...">
-        <button id="darkBtn" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">Dark / Light</button>
+        <input id="filterInput" class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" placeholder="فیلتر اینترفیس‌ها...">
+        <button id="darkBtn" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">تیره / روشن</button>
       </div>
     </div>
 
     <div id="summary" class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
       <div class="card p-4 bg-white dark:bg-gray-800">
-        <div class="text-sm opacity-70 mb-1">Interfaces</div>
-        <div id="sum-ifaces" class="text-2xl font-bold">-</div>
+        <div class="text-sm opacity-70 mb-1">تعداد اینترفیس‌ها</div>
+        <div id="sum-ifaces" class="text-2xl font-bold ltr">-</div>
       </div>
       <div class="card p-4 bg-white dark:bg-gray-800">
-        <div class="text-sm opacity-70 mb-1">Total Download (Mbps)</div>
-        <div id="sum-rx" class="text-2xl font-bold">-</div>
+        <div class="text-sm opacity-70 mb-1">مجموع دانلود (Mbps)</div>
+        <div id="sum-rx" class="text-2xl font-bold ltr">-</div>
       </div>
       <div class="card p-4 bg-white dark:bg-gray-800">
-        <div class="text-sm opacity-70 mb-1">Total Upload (Mbps)</div>
-        <div id="sum-tx" class="text-2xl font-bold">-</div>
+        <div class="text-sm opacity-70 mb-1">مجموع آپلود (Mbps)</div>
+        <div id="sum-tx" class="text-2xl font-bold ltr">-</div>
       </div>
     </div>
 
@@ -273,25 +319,29 @@ HTML = r"""
   <template id="card-template">
     <div class="card p-4 bg-white dark:bg-gray-800 flex flex-col gap-3">
       <div class="flex items-start justify-between gap-3">
-        <div>
-          <div class="font-bold text-lg k name"></div>
+        <div class="min-w-0 flex flex-col gap-1">
+          <div class="flex items-center gap-2">
+            <div class="font-bold text-lg k name truncate"></div>
+            <button class="ctrl-btn hidden badge badge-btn b-up">
+              <span class="btn-label">توقف</span>
+            </button>
+          </div>
           <div class="text-xs opacity-80 flags"></div>
           <div class="text-xs opacity-80 meta"></div>
           <div class="text-xs opacity-80 addrs"></div>
         </div>
         <div class="text-right text-sm">
-          <div class="mb-1"><span class="badge state b-unk">UNKNOWN</span></div>
-          <div>DL <span class="rx-rate font-semibold">0</span></div>
-          <div>UL <span class="tx-rate font-semibold">0</span></div>
-          <div class="opacity-60 text-[11px] mt-1">Total: DL <span class="rx-tot">0</span> | UL <span class="tx-tot">0</span></div>
+          <div class="mb-2"><span class="badge state b-unk">نامشخص</span></div>
+          <div>دانلود <span class="rx-rate font-semibold ltr">0</span></div>
+          <div>آپلود <span class="tx-rate font-semibold ltr">0</span></div>
+          <div class="opacity-60 text-[11px] mt-1">مجموع: دانلود <span class="rx-tot ltr">0</span> | آپلود <span class="tx-tot ltr">0</span></div>
         </div>
       </div>
-      <div class="h-36"><canvas class="chart"></canvas></div>
+      <div class="h-36 ltr"><canvas class="chart"></canvas></div>
     </div>
   </template>
 
   <script>
-    // Fallback lightweight chart if Chart.js not available
     (function ensureChart(){
       if (window.Chart) return;
       function MiniChart(ctx, config){
@@ -321,6 +371,7 @@ HTML = r"""
     })();
 
     const MAX_POINTS = {{max_points}};
+    const CONTROL_TOKEN = {{ token|tojson }};
     const cards = new Map();
 
     function fmtBitsPerSec(bytes_per_sec){
@@ -335,22 +386,19 @@ HTML = r"""
     }
     function badgeFor(state){
       state = (state||"").toUpperCase();
-      if(state==="UP") return {text:"UP", cls:"badge b-up"};
-      if(state==="DOWN") return {text:"DOWN", cls:"badge b-down"};
-      return {text: state || "UNKNOWN", cls:"badge b-unk"};
+      if(state==="UP") return {text:"فعال", cls:"badge b-up"};
+      if(state==="DOWN") return {text:"پایین", cls:"badge b-down"};
+      return {text: "نامشخص", cls:"badge b-unk"};
     }
 
     function makeChart(canvas){
       const ctx = canvas.getContext('2d');
       return new Chart(ctx, {
         type: 'line',
-        data: {
-          labels: [],
-          datasets: [
-            { label: 'Download', data: [], tension: 0.35, fill: true },
-            { label: 'Upload', data: [], tension: 0.35, fill: true }
-          ]
-        },
+        data: { labels: [], datasets: [
+          { label: 'دانلود', data: [], tension: 0.35, fill: true },
+          { label: 'آپلود', data: [], tension: 0.35, fill: true }
+        ]},
         options: {
           responsive: true, maintainAspectRatio: false,
           plugins: { legend: { display: true, position: 'bottom' } },
@@ -359,14 +407,41 @@ HTML = r"""
       });
     }
 
-    function addrLines(addresses){
-      if(!addresses || !addresses.length) return "<span class='opacity-60'>No IP</span>";
-      const v4 = addresses.filter(a=>a.family==="inet").map(a=>a.cidr);
-      const v6 = addresses.filter(a=>a.family==="inet6").map(a=>a.cidr);
-      let html = "";
-      if(v4.length){ html += "<div>IPv4: <span class='k'>" + v4.join(", ") + "</span></div>"; }
-      if(v6.length){ html += "<div>IPv6: <span class='k'>" + v6.join(", ") + "</span></div>"; }
-      return html;
+    function styleButton(btn, isUp){
+      btn.classList.remove('hidden');
+      btn.classList.remove('b-up','b-down');
+      if (isUp){
+        btn.classList.add('b-down');
+        btn.querySelector('.btn-label').textContent = 'توقف';
+      } else {
+        btn.classList.add('b-up');
+        btn.querySelector('.btn-label').textContent = 'ازسرگیری';
+      }
+    }
+
+    async function controlIface(btn, name, action){
+      const headers = CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {};
+      const confirmMsg = (action === 'down')
+            ? `اینترفیس «${name}» متوقف شود؟\nهشدار: ممکن است اتصال شما قطع شود.`
+            : `اینترفیس «${name}» فعال شود؟`;
+      if(!confirm(confirmMsg)) return;
+      const prevText = btn.querySelector('.btn-label').textContent;
+      btn.setAttribute('disabled','disabled');
+      btn.querySelector('.btn-label').textContent = 'در حال انجام...';
+      try{
+        const res = await fetch(`/api/iface/${encodeURIComponent(name)}/${action}`, {
+          method: 'POST', headers
+        });
+        if(!res.ok){
+          const t = await res.text();
+          alert(`انجام نشد: ${res.status} ${t}`);
+        }
+      }catch(e){
+        alert('خطا در انجام عملیات: '+e);
+      }finally{
+        btn.removeAttribute('disabled');
+        btn.querySelector('.btn-label').textContent = prevText;
+      }
     }
 
     async function loadInterfaces(){
@@ -391,9 +466,24 @@ HTML = r"""
 
         const flags = (it.flags||[]).join(",");
         const mac = it.mac ? (" | MAC: <span class='k'>" + it.mac + "</span>") : "";
-        card.querySelector('.flags').innerHTML = "Flags: " + (flags || "none");
+        card.querySelector('.flags').innerHTML = "پرچم‌ها: " + (flags || "هیچ");
         card.querySelector('.meta').innerHTML = "MTU: " + (it.mtu ?? "-") + mac;
-        card.querySelector('.addrs').innerHTML = addrLines(it.addresses);
+
+        const v4 = (it.addresses||[]).filter(a=>a.family==="inet").map(a=>a.cidr);
+        const v6 = (it.addresses||[]).filter(a=>a.family==="inet6").map(a=>a.cidr);
+        let addrHTML = "";
+        if(v4.length) addrHTML += "IPv4: <span class='k'>" + v4.join(", ") + "</span>";
+        if(v6.length) addrHTML += (addrHTML? "<br>" : "") + "IPv6: <span class='k'>" + v6.join(", ") + "</span>";
+        card.querySelector('.addrs').innerHTML = addrHTML || "<span class='opacity-60'>بدون IP</span>";
+
+        const btn = card.querySelector('.ctrl-btn');
+        const isUp = !!it.is_up;
+        styleButton(btn, isUp);
+        btn.onclick = async ()=>{
+          const act = isUp ? 'down' : 'up';
+          await controlIface(btn, it.name, act);
+          await loadInterfaces();
+        };
 
         wrap.appendChild(card);
         let chart;
@@ -411,12 +501,12 @@ HTML = r"""
           const card = cards.get(iface);
           if(!card) continue;
           const ch = card.chart;
-          ch.data.labels = (series.ts || []).map(t => new Date(t*1000).toLocaleTimeString('en-GB',{hour12:false}));
+          ch.data.labels = (series.ts || []).map(t => new Date(t*1000).toLocaleTimeString('fa-IR'));
           ch.data.datasets[0].data = (series.rx_mbps || []).map(v => Number(v).toFixed(2));
           ch.data.datasets[1].data = (series.tx_mbps || []).map(v => Number(v).toFixed(2));
           ch.update('none');
         }
-      }catch(e){ /* ignore */ }
+      }catch(e){}
     }
 
     async function tick(){
@@ -439,7 +529,7 @@ HTML = r"""
             card.el.querySelector('.tx-tot').textContent  = fmtBytes(info.tx_bytes);
 
             const ch = card.chart;
-            const label = new Date(info.ts*1000).toLocaleTimeString('en-GB',{hour12:false});
+            const label = new Date(info.ts*1000).toLocaleTimeString('fa-IR');
             ch.data.labels.push(label);
             ch.data.datasets[0].data.push(rxMbps.toFixed(2));
             ch.data.datasets[1].data.push(txMbps.toFixed(2));
@@ -450,12 +540,9 @@ HTML = r"""
         }
         document.getElementById('sum-rx').textContent = sumRx.toFixed(1);
         document.getElementById('sum-tx').textContent = sumTx.toFixed(1);
-      }catch(e){
-        // ignore
-      }
+      }catch(e){}
     }
 
-    // filter
     const filterInput = document.getElementById('filterInput');
     filterInput.addEventListener('input', e=>{
       const q = e.target.value.trim().toLowerCase();
@@ -465,7 +552,6 @@ HTML = r"""
       }
     });
 
-    // dark mode
     const darkBtn = document.getElementById('darkBtn');
     function applyTheme(){
       const on = localStorage.getItem('netdash-dark') === '1';
@@ -478,7 +564,6 @@ HTML = r"""
     });
     applyTheme();
 
-    // init
     (async function init(){
       await loadInterfaces();
       await loadHistory();
@@ -491,10 +576,9 @@ HTML = r"""
 </html>
 """
 
-# ------------------------------- routes --------------------------------
 @app.route("/")
 def home():
-    html = render_template_string(HTML, max_points=MAX_POINTS)
+    html = render_template_string(HTML, max_points=MAX_POINTS, token=CONTROL_TOKEN)
     resp = make_response(html)
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -510,6 +594,14 @@ def api_live():
 @app.route("/api/history")
 def api_history():
     return jsonify(history.export())
+
+@app.route("/api/iface/<iface>/down", methods=["POST"])
+def api_iface_down(iface):
+    return iface_action(iface, "down")
+
+@app.route("/api/iface/<iface>/up", methods=["POST"])
+def api_iface_up(iface):
+    return iface_action(iface, "up")
 
 def _flush_on_exit():
     try:
