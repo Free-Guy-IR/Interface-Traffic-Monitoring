@@ -1,7 +1,7 @@
 # Interface-Traffic-Monitoring
 
 مانیتورینگ ترافیک اینترفیس
-<img width="1256" height="616" alt="Screenshot (165)" src="https://github.com/user-attachments/assets/fbadba6e-18f5-433c-a303-bda370b45be3" />
+
 
 # مانیتورینگ ترافیک اینترفیس  
 نرخ‌ها از `/sys/class/net/*/statistics` و اطلاعات پایه از `ip -json` خوانده می‌شوند.  
