@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NetDash v1.4.8
-- برچسب وضعیت UP از «بالاست» به «فعال» تغییر یافت
-- چیدمان LTR برای جلوگیری از برعکس شدن عناصر، برچسب‌ها فارسی
+NetDash v1.4.9 (persist totals)
+- مبتنی بر نسخهٔ پایدار شما (v1.4.8) با حداقل تغییر
+- افزودن «TotalsStore» برای نگه‌داری مجموع دانلود/آپلود هر اینترفیس بین ریستارت‌ها (totals.json)
+- UI همان قبلی است؛ فقط اگر rx_total/tx_total موجود بود، به‌جای شمارندهٔ از زمان بوت نمایش می‌دهد
 """
 import os
 import time
@@ -13,7 +14,7 @@ import subprocess
 from collections import deque, defaultdict
 from flask import Flask, jsonify, render_template_string, make_response, request, abort
 
-VERSION = "1.4.8"
+VERSION = "1.4.9"
 
 POLL_INTERVAL = 1.0   # seconds
 MAX_POINTS    = int(os.environ.get("NETDASH_MAX_POINTS", "120"))
@@ -49,6 +50,7 @@ def _pick_data_home():
 
 DATA_HOME = _pick_data_home()
 HISTORY_FILE = os.path.join(DATA_HOME, "history.json")
+TOTALS_FILE  = os.path.join(DATA_HOME, "totals.json")  # NEW
 
 def _run_ip_json(args):
     try:
@@ -189,6 +191,73 @@ class HistoryStore:
 history = HistoryStore(HISTORY_FILE, MAX_POINTS)
 history.load()
 
+# -------- NEW: persistent cumulative totals across reboots --------
+class TotalsStore:
+    """
+    Keeps cumulative totals across reboots in BYTES.
+    File structure:
+    { "v":1, "ifaces": { "<name>": { "rx_total": float, "tx_total": float, "last_rx": int, "last_tx": int, "t": ts } } }
+    """
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.ifaces = {}
+        self.lock = threading.Lock()
+        self._last_flush = 0.0
+        self.flush_interval = 5.0
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            self.ifaces = obj.get("ifaces", {})
+        except Exception:
+            self.ifaces = {}
+
+    def flush(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_flush) < self.flush_interval:
+            return
+        with self.lock:
+            data = {"v":1, "ifaces": self.ifaces}
+        try:
+            tmp = self.filepath + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.filepath)
+            self._last_flush = now
+        except Exception:
+            pass
+
+    def update(self, name, rx_bytes_now, tx_bytes_now):
+        with self.lock:
+            rec = self.ifaces.get(name) or {"rx_total": 0.0, "tx_total": 0.0, "last_rx": None, "last_tx": None, "t": 0}
+            # RX
+            if rec["last_rx"] is None:
+                rec["last_rx"] = int(rx_bytes_now)
+            else:
+                if rx_bytes_now >= rec["last_rx"]:
+                    rec["rx_total"] += (rx_bytes_now - rec["last_rx"])
+                else:
+                    # counter reset (reboot or link reset)
+                    rec["rx_total"] += rx_bytes_now
+                rec["last_rx"] = int(rx_bytes_now)
+            # TX
+            if rec["last_tx"] is None:
+                rec["last_tx"] = int(tx_bytes_now)
+            else:
+                if tx_bytes_now >= rec["last_tx"]:
+                    rec["tx_total"] += (tx_bytes_now - rec["last_tx"])
+                else:
+                    rec["tx_total"] += tx_bytes_now
+                rec["last_tx"] = int(tx_bytes_now)
+            rec["t"] = time.time()
+            self.ifaces[name] = rec
+            return rec["rx_total"], rec["tx_total"]
+
+totals = TotalsStore(TOTALS_FILE)
+# ----------------------------------------------------------------------
+
 class NetMonitor:
     def __init__(self, poll_interval=1.0):
         self.poll = poll_interval
@@ -213,13 +282,19 @@ class NetMonitor:
                     else:
                         rx_bps = tx_bps = 0.0
                     self.prev[iface] = (rx, tx, now)
+
+                    # NEW: update persistent totals and add to snapshot
+                    rx_total, tx_total = totals.update(iface, rx, tx)
+
                     self.data[iface] = {
                         "rx_bps": rx_bps, "tx_bps": tx_bps,
-                        "rx_bytes": rx, "tx_bytes": tx,
+                        "rx_bytes": rx, "tx_bytes": tx,                # since boot
+                        "rx_total": rx_total, "tx_total": tx_total,     # cumulative persisted
                         "ts": now
                     }
                     history.add(iface, now, rx_bps, tx_bps)
             history.flush()
+            totals.flush()
             time.sleep(self.poll)
 
     def start(self):
@@ -334,7 +409,7 @@ HTML = r"""
           <div class="mb-2"><span class="badge state b-unk">نامشخص</span></div>
           <div>دانلود <span class="rx-rate font-semibold ltr">0</span></div>
           <div>آپلود <span class="tx-rate font-semibold ltr">0</span></div>
-          <div class="opacity-60 text-[11px] mt-1">مجموع: دانلود <span class="rx-tot ltr">0</span> | آپلود <span class="tx-tot ltr">0</span></div>
+          <div class="opacity-60 text-[11px] mt-1">تجمعی: دانلود <span class="rx-tot ltr">0</span> | آپلود <span class="tx-tot ltr">0</span></div>
         </div>
       </div>
       <div class="h-36 ltr"><canvas class="chart"></canvas></div>
@@ -379,7 +454,7 @@ HTML = r"""
       return mbps.toFixed(1) + " Mbps";
     }
     function fmtBytes(x){
-      const units = ["B","KB","MB","GB","TB"];
+      const units = ["B","KB","MB","GB","TB","PB"];
       let i=0, v=Number(x);
       while(v>=1024 && i<units.length-1){ v/=1024; i++; }
       return v.toFixed(v<10?2:1)+" "+units[i];
@@ -525,8 +600,10 @@ HTML = r"""
           if(card){
             card.el.querySelector('.rx-rate').textContent = fmtBitsPerSec(info.rx_bps);
             card.el.querySelector('.tx-rate').textContent = fmtBitsPerSec(info.tx_bps);
-            card.el.querySelector('.rx-tot').textContent  = fmtBytes(info.rx_bytes);
-            card.el.querySelector('.tx-tot').textContent  = fmtBytes(info.tx_bytes);
+            const rxT = (info.rx_total !== undefined && info.rx_total !== null) ? info.rx_total : info.rx_bytes;
+            const txT = (info.tx_total !== undefined && info.tx_total !== null) ? info.tx_total : info.tx_bytes;
+            card.el.querySelector('.rx-tot').textContent  = fmtBytes(rxT);
+            card.el.querySelector('.tx-tot').textContent  = fmtBytes(txT);
 
             const ch = card.chart;
             const label = new Date(info.ts*1000).toLocaleTimeString('fa-IR');
@@ -606,6 +683,7 @@ def api_iface_up(iface):
 def _flush_on_exit():
     try:
         history.flush(force=True)
+        totals.flush(force=True)
     except Exception:
         pass
 
