@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NetDash v1.4.9 (persist totals)
-- مبتنی بر نسخهٔ پایدار شما (v1.4.8) با حداقل تغییر
-- افزودن «TotalsStore» برای نگه‌داری مجموع دانلود/آپلود هر اینترفیس بین ریستارت‌ها (totals.json)
-- UI همان قبلی است؛ فقط اگر rx_total/tx_total موجود بود، به‌جای شمارندهٔ از زمان بوت نمایش می‌دهد
-"""
 import os
 import time
 import json
@@ -14,7 +9,7 @@ import subprocess
 from collections import deque, defaultdict
 from flask import Flask, jsonify, render_template_string, make_response, request, abort
 
-VERSION = "1.4.9"
+
 
 POLL_INTERVAL = 1.0   # seconds
 MAX_POINTS    = int(os.environ.get("NETDASH_MAX_POINTS", "120"))
