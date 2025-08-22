@@ -12,20 +12,39 @@ from flask import Flask, jsonify, render_template_string, make_response, request
 import socket, ipaddress, uuid, random, string
 
 # ---------------------- Config ----------------------
+
 POLL_INTERVAL = 1.0   # seconds
 MAX_POINTS    = int(os.environ.get("NETDASH_MAX_POINTS", "120"))
 HOST          = "0.0.0.0"
 PORT          = int(os.environ.get("NETDASH_PORT", "18080"))
-BLOCK_PORT     = int(os.environ.get("NETDASH_BLOCK_PORT", "18081"))
+BLOCK_PORT    = int(os.environ.get("NETDASH_BLOCK_PORT", "18081"))
+FLUSH_SETS_ON_REMOVE = os.environ.get("NETDASH_FLUSH_SETS_ON_REMOVE","1").lower() in ("1","true","yes","on")
+# --- toggle for block page mode (redirect http to 451) ---
+PAGE_MODE_ENABLED = os.environ.get("NETDASH_PAGE_MODE", "0").lower() in ("1","true","yes","on")
+SNI_BLOCK_ENABLED = os.environ.get("NETDASH_SNI_BLOCK","0").lower() in ("1","true","yes","on")
+ENABLE_PAGE_MODE = os.environ.get("NETDASH_ENABLE_PAGE_MODE","0").lower() in ("1","true","yes","on")
+SNI_LEARN_ENABLED = os.environ.get("NETDASH_SNI_LEARN","0").lower() in ("1","true","yes","on")
+SNI_LEARN_IFACES  = [x.strip() for x in os.environ.get("NETDASH_SNI_IFACES","").split(",") if x.strip()]
+
 
 # control (pause/resume)
 CONTROL_ENABLED = True
-CONTROL_TOKEN   = os.environ.get("NETDASH_TOKEN", "").strip()  # optional token
+CONTROL_TOKEN   = os.environ.get("NETDASH_TOKEN", "").strip()
 DENY_IFACES     = {x.strip() for x in os.environ.get("NETDASH_DENY", "").split(",") if x.strip()}
 ALLOW_IFACES    = {x.strip() for x in os.environ.get("NETDASH_ALLOW", "").split(",") if x.strip()}
+
+# --- ipset + dnsmasq mode (on by default) ---
+USE_DNSMASQ_IPSET = os.environ.get("NETDASH_IPSET_MODE","1").lower() in ("1","true","yes","on")
+IPSET4   = os.environ.get("NETDASH_IPSET4","nd-bl4")        # drop set (IPv4)
+IPSET6   = os.environ.get("NETDASH_IPSET6","nd-bl6")        # drop set (IPv6)
+IPSET4P  = os.environ.get("NETDASH_IPSET4_PAGE","ndp-bl4")  # page set (IPv4, HTTP redirect)
+IPSET6P  = os.environ.get("NETDASH_IPSET6_PAGE","ndp-bl6")  # page set (IPv6, HTTP redirect)
+IPSET_TIMEOUT = int(os.environ.get("NETDASH_IPSET_TIMEOUT","3600"))
+DNSMASQ_CONF  = os.environ.get("NETDASH_DNSMASQ_CONF","/etc/dnsmasq.d/netdash-blocks.conf")
 # ----------------------------------------------------
 
 app = Flask(__name__)
+
 
 
 # ---- Block Page Mini-Server (HTTP only) ----
@@ -35,24 +54,48 @@ BLOCK_PAGE_HTML = r"""
 <!doctype html>
 <html lang="fa" dir="rtl">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>دسترسی مسدود شد</title>
-<style>
-  :root { --bg:#0f172a; --card:#111827; --txt:#e5e7eb; --acc:#22d3ee; }
-  *{box-sizing:border-box} body{margin:0;background:linear-gradient(135deg,#0f172a,#111827);color:var(--txt);font-family:IRANSans, Vazirmatn, Inter, ui-sans-serif, system-ui}
-  .wrap{min-height:100dvh;display:grid;place-items:center;padding:24px}
-  .card{max-width:680px;width:100%;background:rgba(17,24,39,.85);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.06);border-radius:20px;box-shadow:0 10px 50px rgba(0,0,0,.4);padding:28px}
-  .hdr{display:flex;align-items:center;gap:12px;margin-bottom:8px}
-  .dot{width:10px;height:10px;border-radius:999px;background:linear-gradient(90deg,#ef4444,#f59e0b)}
-  h1{font-size:22px;margin:0}
-  p{opacity:.9;line-height:1.8;margin:.2rem 0}
-  .host{direction:ltr;display:inline-block;padding:.2rem .5rem;background:#0b1220;border:1px dashed rgba(255,255,255,.08);border-radius:10px}
-  .cta{margin-top:14px;display:flex;gap:10px;flex-wrap:wrap}
-  .btn{padding:10px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#0b1220;color:var(--txt);text-decoration:none}
-  .btn.acc{background:linear-gradient(90deg,#06b6d4,#22d3ee);color:#0b1220;border:none;font-weight:700}
-  .sub{font-size:12px;opacity:.7;margin-top:10px}
-</style>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NetDash - داشبورد ترافیک شبکه</title>
+
+  <!-- 1) اول: config مربوط به Tailwind -->
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Vazirmatn','Inter','ui-sans-serif','system-ui'] }
+        }
+      }
+    }
+  </script>
+
+  <!-- 2) بعد: خود Tailwind و Chart.js -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- 3) فقط CSS — بدون JS سرگردان -->
+  <style>
+    .card { border-radius: 1rem; box-shadow: 0 2px 24px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.06); }
+    .k { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; direction:ltr }
+    .badge { display:inline-flex; align-items:center; gap:.4rem; padding:.2rem .5rem; border-radius:999px; font-size:.75rem; font-weight:600; }
+    .b-up { background:#d1fae5; color:#065f46; }
+    .b-down { background:#fee2e2; color:#991b1b; }
+    .b-unk { background:#fde68a; color:#92400e; }
+    .badge-btn { cursor:pointer; user-select:none; border: none; display:inline-flex; align-items:center; justify-content:center; white-space:nowrap }
+    .badge-btn:disabled { opacity:.75; cursor:not-allowed; }
+    .ltr { direction:ltr }
+    .name{white-space:normal !important;overflow-wrap:anywhere;word-break:break-word;text-overflow:clip !important}
+
+    /* دکمه محدودیت: متمایز از «حذف محدودیت» */
+    .b-shape{background:#dbeafe;color:#1e3a8a;border:1px solid #60a5fa}
+    .b-clear{background:#fecaca;color:#7f1d1d;border:1px solid #ef4444}
+    /* اگر قبلاً خط زیر را داشتی که هر دو را قرمز می‌کرد، حذفش کن:
+
+    */
+  </style>
+  
 </head>
 <body>
 <div class="wrap">
@@ -69,6 +112,7 @@ BLOCK_PAGE_HTML = r"""
     <div class="sub">کد: 451 | این صفحه به‌جای مقصد HTTP شما نمایش داده شده است.</div>
   </div>
 </div>
+
 </body>
 </html>
 """
@@ -85,11 +129,15 @@ def blocked_any(path):
     return render_template_string(BLOCK_PAGE_HTML, host=host), 451
 
 def start_block_server():
-    th = threading.Thread(
-        target=lambda: blockapp.run(host=HOST, port=BLOCK_PORT, debug=False, use_reloader=False),
-        daemon=True
-    )
-    th.start()
+    def run(host):
+        blockapp.run(host=host, port=BLOCK_PORT, debug=False, use_reloader=False)
+    threading.Thread(target=run, args=("0.0.0.0",), daemon=True).start()
+    try:
+        if socket.has_ipv6:
+            threading.Thread(target=run, args=("::",), daemon=True).start()
+    except Exception:
+        pass
+
 
 
 
@@ -115,6 +163,32 @@ def _pick_data_home():
     return os.getcwd()
 
 DATA_HOME = _pick_data_home()
+
+# === SNI logging ===
+SNI_LOG_FILE = os.path.join(DATA_HOME, "sni-seen.log")
+_SNI_LOG_LOCK = threading.Lock()
+
+def _append_sni_log(kind, host, dst_ip, fam=None, base=None, iface=None):
+    rec = {
+        "ts": int(time.time()),
+        "kind": kind,       # مثلاً 'sni'
+        "host": host,       # نامِ کامل ساب‌دامنه از SNI
+        "dst_ip": dst_ip,   # آی‌پی مقصد همان اتصال
+        "fam": fam,         # 'v4' یا 'v6'
+        "base": base,       # دامنه‌ای که در فهرست مسدودی دادی (اگر match شود)
+        "iface": iface,     # اینترفیس (اگر scapy بدهد)
+    }
+    try:
+        os.makedirs(os.path.dirname(SNI_LOG_FILE), exist_ok=True)
+        line = json.dumps(rec, ensure_ascii=False)
+        with _SNI_LOG_LOCK:
+            with open(SNI_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        print("[netdash] SNI log error:", e)
+
+
+
 FILTERS_FILE = os.path.join(DATA_HOME, "filters.json")
 HISTORY_FILE = os.path.join(DATA_HOME, "history.json")
 TOTALS_FILE  = os.path.join(DATA_HOME, "totals.json")
@@ -122,12 +196,14 @@ PERIOD_FILE  = os.path.join(DATA_HOME, "period_totals.json")
 
 # ------------------ Helpers ------------------
 def _run_ip_json(args):
-    """Call `ip -json` and parse the JSON; return [] on failure."""
+    """Call `ip -json` (یا `-j`) و خروجی JSON را برگردان؛ در خطا []"""
+    ipbin = _find_ip_binary()
     try:
-        out = subprocess.check_output(["ip"] + args, text=True)
+        out = subprocess.check_output([ipbin] + args, text=True)
         return json.loads(out)
     except Exception:
         return []
+
 
 def can_control(iface: str) -> bool:
     if not CONTROL_ENABLED or not iface:
@@ -212,7 +288,6 @@ def get_interfaces_info():
             "mtu": mtu, "mac": mac, "addresses": addresses,
             "can_control": can_control(name), "is_up": is_up,
             "link": get_link_info(name) if name else {"speed": None, "duplex": None},
-            "shape": tc_status(name),
             "shape": tc_status(name),
             "kind": info_kind,
         })
@@ -300,23 +375,46 @@ class HistoryStore:
             with open(self.filepath, "r", encoding="utf-8") as f:
                 obj = json.load(f)
             maxp = int(obj.get("max_points", self.max_points))
-            self.max_points = maxp
-            raw = obj.get("data", {})
+            raw  = obj.get("data", {})
             with self.lock:
+                self.max_points = maxp
                 self.hist.clear()
-                for iface, arr in raw.items():
+                for iface, arr in (raw or {}).items():
                     dq = deque(maxlen=self.max_points)
                     for tup in arr:
-                        if isinstance(tup, list) and len(tup) >= 3:
-                            dq.append( (float(tup[0]), float(tup[1]), float(tup[2])) )
+                        if isinstance(tup, (list, tuple)) and len(tup) >= 3:
+                            t, rb, tb = tup[0], tup[1], tup[2]
+                            dq.append((float(t), float(rb), float(tb)))
                     self.hist[iface] = dq
         except Exception:
-            pass
+            # اگر فایلی نبود/خراب بود، خالی شروع کن
+            with self.lock:
+                self.hist.clear()
+
+
+
+
+
 
 history = HistoryStore(HISTORY_FILE, MAX_POINTS)
 history.load()
 
 class TotalsStore:
+    """
+    ساختار فایل totals.json:
+      {
+        "v": 1,
+        "ifaces": {
+          "<iface>": {
+            "rx_total": float,
+            "tx_total": float,
+            "last_rx": int | null,
+            "last_tx": int | null,
+            "t": float
+          }
+        }
+      }
+    """
     def __init__(self, filepath):
         self.filepath = filepath
         self.ifaces = {}
@@ -329,16 +427,33 @@ class TotalsStore:
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
                 obj = json.load(f)
-            self.ifaces = obj.get("ifaces", {})
+            raw_ifaces = obj.get("ifaces", {})
+            if not isinstance(raw_ifaces, dict):
+                raw_ifaces = {}
         except Exception:
-            self.ifaces = {}
+            raw_ifaces = {}
+
+        cleaned = {}
+        for name, rec in raw_ifaces.items():
+            if not isinstance(rec, dict):
+                continue
+            cleaned[name] = {
+                "rx_total": float(rec.get("rx_total", 0.0)),
+                "tx_total": float(rec.get("tx_total", 0.0)),
+                "last_rx": (int(rec["last_rx"]) if rec.get("last_rx") is not None else None),
+                "last_tx": (int(rec["last_tx"]) if rec.get("last_tx") is not None else None),
+                "t": float(rec.get("t", 0.0)),
+            }
+
+        with self.lock:
+            self.ifaces = cleaned
 
     def flush(self, force=False):
         now = time.time()
         if not force and (now - self._last_flush) < self.flush_interval:
             return
         with self.lock:
-            data = {"v":1, "ifaces": self.ifaces}
+            data = {"v": 1, "ifaces": self.ifaces}
         try:
             tmp = self.filepath + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -350,26 +465,36 @@ class TotalsStore:
 
     def update(self, name, rx_bytes_now, tx_bytes_now):
         with self.lock:
-            rec = self.ifaces.get(name) or {"rx_total": 0.0, "tx_total": 0.0, "last_rx": None, "last_tx": None, "t": 0}
+            rec = self.ifaces.get(name) or {
+                "rx_total": 0.0, "tx_total": 0.0,
+                "last_rx": None, "last_tx": None, "t": 0.0
+            }
+
+            # RX
             if rec["last_rx"] is None:
                 rec["last_rx"] = int(rx_bytes_now)
             else:
                 if rx_bytes_now >= rec["last_rx"]:
-                    rec["rx_total"] += (rx_bytes_now - rec["last_rx"])
+                    rec["rx_total"] += (int(rx_bytes_now) - rec["last_rx"])
                 else:
-                    rec["rx_total"] += rx_bytes_now
+                    # wrap/reset
+                    rec["rx_total"] += int(rx_bytes_now)
                 rec["last_rx"] = int(rx_bytes_now)
+
+            # TX
             if rec["last_tx"] is None:
                 rec["last_tx"] = int(tx_bytes_now)
             else:
                 if tx_bytes_now >= rec["last_tx"]:
-                    rec["tx_total"] += (tx_bytes_now - rec["last_tx"])
+                    rec["tx_total"] += (int(tx_bytes_now) - rec["last_tx"])
                 else:
-                    rec["tx_total"] += tx_bytes_now
+                    rec["tx_total"] += int(tx_bytes_now)
                 rec["last_tx"] = int(tx_bytes_now)
+
             rec["t"] = time.time()
             self.ifaces[name] = rec
             return rec["rx_total"], rec["tx_total"]
+
 
 totals = TotalsStore(TOTALS_FILE)
 
@@ -537,22 +662,23 @@ class PingMonitor:
         self.running = False
 
     def _ping_once(self, target):
-        try:
-            # -n numeric, -c 1 count, -W timeout(sec) on busybox; on iputils new it's -w deadline(sec)
-            # We'll try -c 1 -w and fallback to -W.
-            cmd = ["ping", "-n", "-c", "1", "-w", "1", target]
+        # تلاش با iputils (-w)، در صورت خطا/عدم پشتیبانی، busybox (-W)
+        for cmd in (
+            ["ping", "-n", "-c", "1", "-w", "1", target],  # iputils
+            ["ping", "-n", "-c", "1", "-W", "1", target],  # busybox
+        ):
             try:
                 out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=self.timeout)
             except subprocess.CalledProcessError as e:
                 out = e.output or ""
             except subprocess.TimeoutExpired:
-                return None  # timeout
+                return None
+    
             m = re.search(r"time[=<]\s*([0-9.]+)\s*ms", out)
             if m:
                 return float(m.group(1))
-            return None
-        except Exception:
-            return None
+        return None
+
 
     def _loop(self):
         while self.running:
@@ -591,9 +717,232 @@ class PingMonitor:
 pingmon = PingMonitor()
 pingmon.start()
 
+
+
 # ------------------ Traffic Shaping (tc) ------------------
 
 # ------------------ Address Filters (iptables) ------------------
+
+
+def _run_root(cmd):
+    c = cmd[:]
+    if os.geteuid() != 0:
+        c = ["sudo", "-n"] + c
+    try:
+        subprocess.check_call(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+    except subprocess.CalledProcessError:
+        return 1
+
+def _ipt_ensure(args, table=None, v6=False):
+    base = ["ip6tables"] if v6 else ["iptables"]
+    if table:
+        base += ["-t", table]
+    check = base + ["-C"] + args
+    insert = base + ["-I"] + args
+    if _run_root(check) != 0:
+        _run_root(insert)
+
+def ensure_ipset_and_rules():
+    # sets
+    for name,fam in ((IPSET4,"inet"),(IPSET6,"inet6"),(IPSET4P,"inet"),(IPSET6P,"inet6")):
+        _run_root(["ipset","create",name,"hash:net","family",fam,"timeout",str(IPSET_TIMEOUT),"-exist"])
+
+def ensure_ipset_and_rules():
+    # ...
+    # DROP برای nd-* همیشه لازم است:
+    _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET4,"dst","-j","DROP"])
+    _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET4,"dst","-j","DROP"])
+    _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET6,"dst","-j","DROP"], v6=True)
+    _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET6,"dst","-j","DROP"], v6=True)
+
+    # اگر page-mode روشن است، ndp-* را DROP نکن؛ فقط NAT redirect روی 80 بزن.
+    if PAGE_MODE_ENABLED:
+        for ch in ("OUTPUT","PREROUTING"):
+            _ipt_ensure([ch,"-p","tcp","-m","set","--match-set",IPSET4P,"dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat")
+            _ipt_ensure([ch,"-p","tcp","-m","set","--match-set",IPSET6P,"dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat", v6=True)
+    else:
+        # اگر page-mode خاموش است، ndp-* هم مثل بقیه DROP شود
+        _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET4P,"dst","-j","DROP"])
+        _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET4P,"dst","-j","DROP"])
+        _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET6P,"dst","-j","DROP"], v6=True)
+        _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET6P,"dst","-j","DROP"], v6=True)
+
+
+
+def _dnsmasq_hup():
+    # اول pkill -HUP؛ اگر نبود، systemctl reload
+    if _run_root(["pkill","-HUP","dnsmasq"]) != 0:
+        _run_root(["systemctl","reload","dnsmasq"])
+
+
+
+
+
+# 👇👇 اینجا بچسبان
+def _prime_dnsmasq_for_items(items_dict):
+    domains = set()
+    for it in items_dict.values():
+        pat = (it or {}).get("pattern","").strip()
+        if pat and _split_family(pat) is None:
+            domains.add(pat)
+
+    def _prime_one(dom, qtype):
+        cmds = [
+            ["dig", "+short", qtype, dom, "@127.0.0.1"],
+            ["drill", "-Q", dom, qtype, "@127.0.0.1"],
+            ["host", "-t", qtype, dom, "127.0.0.1"],
+        ]
+        for cmd in cmds:
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                return
+            except Exception:
+                continue
+
+    time.sleep(0.1)  # بعد از HUP
+    for d in domains:
+        _prime_one(d, "A")
+        _prime_one(d, "AAAA")
+
+
+
+
+def _rebuild_dnsmasq_conf_from_items(items_dict):
+    """
+    از روی self.items، فایل dnsmasq داینامیک بساز:
+      - دامنه‌هایی که show_page=False ⇒ ستِ Drop
+      - دامنه‌هایی که show_page=True  ⇒ ستِ Page (ریدایرکت HTTP)
+    """
+    lines = []
+    for it in items_dict.values():
+        pat = (it or {}).get("pattern","").strip()
+        fam = _split_family(pat)
+        if fam is None and pat:  # domain
+            dom = _normalize_domain_or_none(pat)
+            if not dom:
+                # اگر اسمِ بدون پسوند یا نامعتبر بود، رد می‌کنیم
+                continue
+            variants = _domain_variants(dom)  # { 'example.com', '.example.com', 'xn--....', '.xn--....' }
+            if PAGE_MODE_ENABLED and it.get("show_page"):
+                for v in variants:
+                    lines.append(f"ipset=/{v}/{IPSET4P}")
+                    lines.append(f"ipset=/{v}/{IPSET6P}")
+            else:
+                for v in variants:
+                    lines.append(f"ipset=/{v}/{IPSET4}")
+                    lines.append(f"ipset=/{v}/{IPSET6}")
+
+    content = ("# netdash dynamic blocklist\n" + "\n".join(lines) + ("\n" if lines else ""))
+    try:
+        os.makedirs(os.path.dirname(DNSMASQ_CONF), exist_ok=True)
+    except Exception:
+        pass
+    tmp = DNSMASQ_CONF + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, DNSMASQ_CONF)
+
+    _dnsmasq_hup()
+    _prime_dnsmasq_for_items(items_dict)  # همین بس است؛ خطِ اضافه حذف شد
+
+    
+def _hostname_matches(host: str, base: str) -> bool:
+    """host endswith .base یا مساوی با base (هر دو نرمالایز)."""
+    try:
+        host = (host or "").strip().lower().strip(".")
+        base = _normalize_domain_or_none(base) or (base or "").strip().lower()
+        if not host or not base:
+            return False
+        return host == base or host.endswith("." + base)
+    except Exception:
+        return False
+
+def _extract_sni_from_clienthello(data: bytes):
+    """
+    از TLS ClientHello در TCP payload، SNI را در می‌آورد.
+    حداقل‌گرایانه و سریع؛ اگر پکت ناقص/تکه‌تکه باشد None می‌دهد.
+    """
+    try:
+        if not data or len(data) < 5:
+            return None
+        # TLS record header: type(1)=22(handshake), ver(2), len(2)
+        if data[0] != 22:
+            return None
+        p = 5
+        if len(data) < p + 4 or data[p] != 1:  # HandshakeType=ClientHello(1)
+            return None
+        hs_len = int.from_bytes(data[p+1:p+4], "big")
+        p += 4
+        if len(data) < p + hs_len:
+            return None  # احتمالاً تکه‌تکه شده
+        # skip: version(2) + random(32)
+        p += 2 + 32
+        if len(data) < p + 1: return None
+        sid_len = data[p]; p += 1 + sid_len
+        if len(data) < p + 2: return None
+        cs_len = int.from_bytes(data[p:p+2], "big"); p += 2 + cs_len
+        if len(data) < p + 1: return None
+        cm_len = data[p]; p += 1 + cm_len
+        if len(data) < p + 2: return None
+        ext_len = int.from_bytes(data[p:p+2], "big"); p += 2
+        end = min(len(data), p + ext_len)
+        while p + 4 <= end:
+            etype = int.from_bytes(data[p:p+2], "big"); p += 2
+            elen  = int.from_bytes(data[p:p+2], "big"); p += 2
+            if etype == 0:  # server_name
+                if p + 2 > len(data): return None
+                list_len = int.from_bytes(data[p:p+2], "big"); p += 2
+                q = p
+                while q + 3 <= len(data) and q < p + list_len:
+                    nt = data[q]; q += 1
+                    nl = int.from_bytes(data[q:q+2], "big"); q += 2
+                    if nt == 0 and q + nl <= len(data):
+                        try:
+                            return data[q:q+nl].decode("idna").lower()
+                        except Exception:
+                            try: return data[q:q+nl].decode().lower()
+                            except Exception: return None
+                    q += nl
+                return None
+            else:
+                p += elen
+        return None
+    except Exception:
+        return None
+    
+    
+    
+
+def _flush_all_ipsets():
+    """تمام ست‌های ipset مربوط به NetDash را خالی می‌کند."""
+    for name in (IPSET4, IPSET6, IPSET4P, IPSET6P):
+        try:
+            _run_root(["ipset", "flush", name])
+        except Exception:
+            pass
+
+def _del_domain_from_ipsets(domain: str, show_page: bool):
+    """
+    IPهای فعلیِ A/AAAA دامنه را resolve می‌کند و از ست درست حذف می‌کند.
+    توجه: شامل ساب‌دامنه‌هایی که الان resolve نشده‌اند نمی‌شود.
+    برای اطمینان کامل می‌توانیم بعدش flush کلی انجام دهیم (قابل‌تنظیم با ENV).
+    """
+    v4, v6 = _resolve_domain(domain)
+    sets = []
+    if show_page:
+        sets = [(IPSET4P, v4), (IPSET6P, v6)]
+    else:
+        sets = [(IPSET4,  v4), (IPSET6,  v6)]
+    for setname, arr in sets:
+        for ip in arr:
+            try:
+                _run_root(["ipset", "del", setname, ip])
+            except Exception:
+                pass
+
+
+
 def _iptables_bin(ipv6=False):
     candidates = ("/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables", "iptables") if not ipv6 else \
                  ("/usr/sbin/ip6tables", "/sbin/ip6tables", "/usr/bin/ip6tables", "ip6tables")
@@ -642,6 +991,33 @@ def _resolve_domain(name):
     except Exception:
         pass
     return list(v4), list(v6)
+    
+def _normalize_domain_or_none(pat: str):
+    s = (pat or "").strip().lower()
+    s = re.sub(r'^[a-z]+://', '', s)
+    s = s.split('/', 1)[0]
+    s = s.split(':', 1)[0]
+    if s.startswith('*.'):
+        s = s[2:]
+    s = s.strip('.')
+    if not s or '.' not in s:
+        return None
+    if not re.fullmatch(r'[0-9a-z.-]+', s):
+        pass
+    return s
+
+def _domain_variants(dom: str):
+    out = set()
+    try:
+        puny = dom.encode('idna').decode('ascii')
+    except Exception:
+        puny = dom
+    for d in {dom, puny}:
+        d = d.strip('.')
+        out.add(d)
+        out.add('.' + d)
+    return out    
+    
 
 def _mk_rule_cmds(dst_ip, chain, iface=None, proto="all", port=None, ipv6=False):
     """
@@ -701,17 +1077,51 @@ def _apply_nat_redirect(dst, chain, ipv6):
     except subprocess.CalledProcessError:
         return None
 
+# اگر قبلاً نداری: یک نرمالایزر ساده روی دامنه
+def _normalize_domain(pat: str) -> str:
+    d = _normalize_domain_or_none(pat)  # همون که قبلاً اضافه کردی
+    return d if d is not None else (pat or "").strip().lower()
+
+def _add_sni_rules_for_domain(domain: str):
+    """اتصالات NEW روی 443/TCP را اگر SNI شامل domain بود DROP می‌کند (همهٔ ساب‌دامنه‌ها)."""
+    rules = []
+    dom = _normalize_domain(domain)
+    if not dom:
+        return rules
+
+    for ipv6 in (False, True):
+        binp = _iptables_bin(ipv6)
+        for chain in ("FORWARD", "OUTPUT"):
+            # اول چک کن وجود نداشته باشد (-C)، بعد درج (-I)
+            cmd_insert = [binp, "-I", chain, "-p", "tcp", "--dport", "443",
+                          "-m", "conntrack", "--ctstate", "NEW",
+                          "-m", "string", "--string", dom, "--algo", "bm",
+                          "-j", "DROP"]
+            cmd_check = _chk_equivalent(cmd_insert)
+            if _run_root(_sudo_wrap(cmd_check)) == 0:
+                # قبلاً هست؛ دوباره درج نکن
+                continue
+            if _run_root(_sudo_wrap(cmd_insert)) == 0:
+                rules.append({"cmd": cmd_insert, "chain": chain, "ipv6": ipv6})
+    return rules
+
+def _del_rule_obj(r):
+    """قانون ذخیره‌شده را حذف می‌کند (معادل -D از روی -I)."""
+    cmd = (r or {}).get("cmd") or []
+    if not cmd:
+        return
+    dcmd = _del_equivalent(cmd)
+    _run_root(_sudo_wrap(dcmd))
+
 
 
 class FilterStore:
     """
-    ذخیره و اعمال قوانین بلاک آدرس.
-    هر آیتم: {
+    هر آیتم:
       id, pattern, iface, proto, port, created,
       realized: {v4:[], v6:[]},
-      rules: [{cmd:list, chain:str, ipv6:bool}],
-      show_page: bool
-    }
+      show_page: bool,
+      backend: "ipset"|"legacy"
     """
     def __init__(self, path):
         self.path = path
@@ -727,7 +1137,6 @@ class FilterStore:
         except Exception:
             raw_items = {}
 
-        # نرمال‌سازی: همیشه دیکشنری با کلید id داشته باشیم
         items = {}
         if isinstance(raw_items, list):
             for it in raw_items:
@@ -739,33 +1148,44 @@ class FilterStore:
                 rid = (v or {}).get("id") or str(k)
                 v["id"] = rid
                 items[rid] = v
-        else:
-            items = {}
 
         with self.lock:
             self.items = items
 
-        # ری‌استور قوانین به iptables/ip6tables
-        for rec in list(items.values()):
-            for r in rec.get("rules", []):
-                cmd = r.get("cmd") or []
-                if not cmd or not isinstance(cmd, list):
-                    continue
-                try:
-                    chk = _chk_equivalent(cmd)
-                    subprocess.check_call(chk, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    continue  # قانون هست
-                except subprocess.CalledProcessError:
-                    pass
-                try:
-                    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except subprocess.CalledProcessError:
-                    # fallback: بدون sudo
+        # --- بازگردانی state کرنل در بوت ---
+        if USE_DNSMASQ_IPSET:
+            ensure_ipset_and_rules()
+            _rebuild_dnsmasq_conf_from_items(self.items)
+            if SNI_BLOCK_ENABLED:
+                for rec in self.items.values():
+                    pat = (rec or {}).get("pattern", "").strip()
+                    if pat and _split_family(pat) is None:
+                        try:
+                            rec["sni_rules"] = _add_sni_rules_for_domain(pat)
+                        except Exception as e:
+                            print(f"[netdash] SNI add failed for {pat}: {e}")
+                self.flush()
+        else:
+            # حالت legacy: قوانین ذخیره‌شده iptables را دوباره اعمال کن
+            for rec in list(items.values()):
+                for r in rec.get("rules", []):
+                    cmd = r.get("cmd") or []
+                    if not cmd or not isinstance(cmd, list):
+                        continue
                     try:
-                        base = [c for c in cmd if c not in ("sudo", "-n")]
-                        subprocess.check_call(base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception:
+                        chk = _chk_equivalent(cmd)
+                        subprocess.check_call(chk, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        continue
+                    except subprocess.CalledProcessError:
                         pass
+                    try:
+                        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except subprocess.CalledProcessError:
+                        try:
+                            base = [c for c in cmd if c not in ("sudo", "-n")]
+                            subprocess.check_call(base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
 
     def flush(self):
         try:
@@ -780,32 +1200,67 @@ class FilterStore:
         with self.lock:
             return list(self.items.values())
 
-    def _apply_one(self, dst, iface, proto, port, chain, ipv6):
-        cmd = _mk_rule_cmds(dst, chain, iface=iface, proto=proto, port=port, ipv6=ipv6)
-        try:
-            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return {"cmd": cmd, "chain": chain, "ipv6": bool(ipv6)}
-        except subprocess.CalledProcessError:
-            return None
-
     def add(self, pattern, iface=None, proto="all", port=None, show_page=False):
-        # تعیین لیست IPها
-        fam = _split_family(pattern)
+        pat = (pattern or "").strip()
+        if not pat:
+            raise ValueError("pattern empty")
+
+        fam = _split_family(pat)
+        fid = uuid.uuid4().hex[:12]
+        rec = {
+            "id": fid,
+            "pattern": pat,
+            "iface": iface or None,
+            "proto": (proto or "all").lower(),
+            "port": (int(port) if port else None),
+            "created": int(time.time()),
+            "realized": {"v4": [], "v6": []},
+            "show_page": bool(show_page),
+            "backend": "ipset" if USE_DNSMASQ_IPSET else "legacy",
+        }
+
+        if USE_DNSMASQ_IPSET:
+            # دامنه → dnsmasq/ipset
+            if fam is None:
+                with self.lock:
+                    self.items[fid] = rec
+                    self.flush()
+                _rebuild_dnsmasq_conf_from_items(self.items)
+                if SNI_BLOCK_ENABLED:
+                    rec["sni_rules"] = _add_sni_rules_for_domain(pat)
+                    with self.lock:
+                        self.items[fid] = rec
+                        self.flush()
+                return rec
+
+            # IP/CIDR → مستقیم به ipset
+            if fam == 'v4':
+                setname = (IPSET4P if (show_page and PAGE_MODE_ENABLED) else IPSET4)
+                _run_root(["ipset","add", setname, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                rec["realized"]["v4"].append(pat)
+            elif fam == 'v6':
+                setname = (IPSET6P if (show_page and PAGE_MODE_ENABLED) else IPSET6)
+                _run_root(["ipset","add", setname, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                rec["realized"]["v6"].append(pat)
+
+            with self.lock:
+                self.items[fid] = rec
+                self.flush()
+            return rec
+
+        # ---- fallback: iptables per-IP (legacy) ----
+        rules = []
+        chains = ["OUTPUT", "FORWARD"]
         if fam is None:
-            v4, v6 = _resolve_domain(pattern)
+            v4, v6 = _resolve_domain(pat)
         elif fam == 'v4':
-            v4, v6 = [pattern], []
+            v4, v6 = [pat], []
         else:
-            v4, v6 = [], [pattern]
+            v4, v6 = [], [pat]
 
         if not v4 and not v6:
             raise ValueError("آدرس/دامنه قابل resolved نیست یا نامعتبر است.")
 
-        fid = uuid.uuid4().hex[:12]
-        rules = []
-        chains = ["OUTPUT", "FORWARD"]  # هم محلی، هم مسیریابی
-
-        # DROP فیلتر
         for ip in v4:
             for ch in chains:
                 r = self._apply_one(ip, iface, proto, port, ch, ipv6=False)
@@ -815,7 +1270,6 @@ class FilterStore:
                 r = self._apply_one(ip, iface, proto, port, ch, ipv6=True)
                 if r: rules.append(r)
 
-        # ریدایرکت صفحه مسدودسازی (HTTP/80) به BLOCK_PORT
         if show_page:
             for ip in v4:
                 for ch in ("OUTPUT", "PREROUTING"):
@@ -828,28 +1282,24 @@ class FilterStore:
 
         if not rules:
             raise RuntimeError("هیچ قانون iptables/ip6tables اعمال نشد.")
-
-        rec = {
-            "id": fid,
-            "pattern": pattern,
-            "iface": iface or None,
-            "proto": (proto or "all").lower(),
-            "port": (int(port) if port else None),
-            "created": int(time.time()),
-            "realized": {"v4": v4, "v6": v6},
-            "rules": rules,
-            "show_page": bool(show_page),
-        }
+        rec["rules"] = rules
+        rec["realized"] = {"v4": v4, "v6": v6}
         with self.lock:
             self.items[fid] = rec
             self.flush()
         return rec
 
+    def _apply_one(self, dst, iface, proto, port, chain, ipv6):
+        cmd = _mk_rule_cmds(dst, chain, iface=iface, proto=proto, port=port, ipv6=ipv6)
+        if _run_root(cmd) == 0:
+            return {"cmd": cmd, "chain": chain, "ipv6": bool(ipv6)}
+        return None
+
     def remove(self, fid):
+        # پیدا کردن رکورد
         with self.lock:
             rec = self.items.get(fid)
             if not rec:
-                # فالس‌بک: اگر کلید dict با id یکی نیست، روی مقدارها جست‌وجو کن
                 for k, v in list(self.items.items()):
                     if (v or {}).get("id") == fid:
                         fid, rec = k, v
@@ -857,100 +1307,205 @@ class FilterStore:
             if not rec:
                 return False
 
-            # حذف هر قانون مرتبط (DROP و NAT) — هم با sudo و هم بدون sudo امتحان کن
-            for r in rec.get("rules", []):
-                cmd = r.get("cmd") or []
-                dcmd = _del_equivalent(cmd)
-                try:
-                    subprocess.check_call(dcmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except subprocess.CalledProcessError:
-                    # fallback 1: اگر sudo نبود، اضافه کن
-                    try:
-                        if "sudo" not in dcmd:
-                            alt = ["sudo", "-n"] + dcmd
-                            subprocess.check_call(alt, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            continue
-                    except subprocess.CalledProcessError:
-                        pass
-                    # fallback 2: اگر sudo هست، بدون sudo هم تست کن
-                    try:
-                        base = [c for c in dcmd if c not in ("sudo", "-n")]
-                        subprocess.check_call(base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except subprocess.CalledProcessError:
-                        # نهایتاً رهایش کن (ممکنه قبلاً حذف شده باشه)
-                        pass
+        # ۱) قوانین SNI
+        for r in (rec.get("sni_rules") or []):
+            try:
+                _del_rule_obj(r)
+            except Exception:
+                pass
 
-            self.items.pop(fid, None)
-            self.flush()
+        pat = (rec or {}).get("pattern", "").strip()
+        fam = _split_family(pat)
+
+        if USE_DNSMASQ_IPSET:
+            # --- دامنه ---
+            if fam is None:
+                with self.lock:
+                    self.items.pop(fid, None)
+                    self.flush()
+                _rebuild_dnsmasq_conf_from_items(self.items)
+                try:
+                    _del_domain_from_ipsets(pat, rec.get("show_page", False))
+                except Exception:
+                    pass
+                if FLUSH_SETS_ON_REMOVE:
+                    _flush_all_ipsets()
+                return True
+
+            # --- IP/CIDR ---
+            setname = None
+            if fam == 'v4':
+                setname = IPSET4P if rec.get("show_page") else IPSET4
+            elif fam == 'v6':
+                setname = IPSET6P if rec.get("show_page") else IPSET6
+            if setname:
+                _run_root(["ipset","del", setname, pat])
+            with self.lock:
+                self.items.pop(fid, None)
+                self.flush()
             return True
 
-
-
-
-    def add(self, pattern, iface=None, proto="all", port=None, show_page=False):
-        # تعیین لیست IP ها
-        fam = _split_family(pattern)
-        if fam is None:
-            # domain → resolve
-            v4, v6 = _resolve_domain(pattern)
-        elif fam == 'v4':
-            v4, v6 = [pattern], []
-        else:
-            v4, v6 = [], [pattern]
-
-        if not v4 and not v6:
-            raise ValueError("آدرس/دامنه قابل resolved نیست یا نامعتبر است.")
-
-        fid = uuid.uuid4().hex[:12]
-        rules = []
-        chains = ["OUTPUT", "FORWARD"]  # هم محلی، هم مسیریابی
-
-        # v4 → قوانین فیلتر (DROP)
-        for ip in v4:
-            for ch in chains:
-                r = self._apply_one(ip, iface, proto, port, ch, ipv6=False)
-                if r: rules.append(r)
-
-        # v6 → قوانین فیلتر (DROP)
-        for ip in v6:
-            for ch in chains:
-                r = self._apply_one(ip, iface, proto, port, ch, ipv6=True)
-                if r: rules.append(r)
-
-        # 🔽🔽🔽 اینجا قطعه‌ی نمایش صفحه را اضافه کن 🔽🔽🔽
-        if show_page:
-            # برای HTTP (پورت 80) ریدایرکت به BLOCK_PORT؛ هم برای ترافیک لوکال (OUTPUT) و هم عبوری (PREROUTING)
-            for ip in v4:
-                for ch in ("OUTPUT", "PREROUTING"):
-                    r = _apply_nat_redirect(ip, ch, ipv6=False)
-                    if r: rules.append(r)
-            for ip in v6:
-                for ch in ("OUTPUT", "PREROUTING"):
-                    r = _apply_nat_redirect(ip, ch, ipv6=True)
-                    if r: rules.append(r)
-        # 🔼🔼🔼
-
-        if not rules:
-            raise RuntimeError("هیچ قانون iptables/ip6tables اعمال نشد.")
-
-        rec = {
-            "id": fid,
-            "pattern": pattern,
-            "iface": iface or None,
-            "proto": (proto or "all").lower(),
-            "port": (int(port) if port else None),
-            "created": int(time.time()),
-            "realized": {"v4": v4, "v6": v6},
-            "rules": rules,
-            "show_page": bool(show_page),
-        }
+        # ---- legacy: حذف قوانین iptables ذخیره‌شده ----
+        for r in (rec.get("rules", []) or []):
+            cmd = r.get("cmd") or []
+            dcmd = _del_equivalent(cmd)
+            if _run_root(dcmd) != 0:
+                base = [c for c in dcmd if c not in ("sudo","-n")]
+                _run_root(base)
         with self.lock:
-            self.items[fid] = rec
+            self.items.pop(fid, None)
             self.flush()
-        return rec
+        return True
+
+
+
+class SNILearner:
+    """
+    ترافیک TCP/443 را روی ifaceهای تعیین‌شده sniff می‌کند،
+    SNI را از ClientHello می‌خواند، و اگر زیرمجموعهٔ یکی از دامنه‌های بلاک‌شده بود،
+    IP مقصد را به ipset مناسب اضافه می‌کند (با timeout).
+    """
+    def __init__(self, ifaces=None):
+        self.ifaces = list(ifaces) if ifaces else None
+        self.running = False
+
+    def _match_any_blocked(self, host):
+        """اگر host زیرمجموعهٔ یکی از patternهای دامنه در FilterStore باشد، همان رکورد را برگردان."""
+        try:
+            with filters.lock:
+                for rec in filters.items.values():
+                    pat = (rec or {}).get("pattern","").strip()
+                    if not pat or _split_family(pat) is not None:
+                        continue  # IP/CIDR نیستیم دامنه می‌خواهیم
+                    if _hostname_matches(host, pat):
+                        return rec  # اولین match کافی است
+        except Exception:
+            pass
+        return None
+
+    def _handle_packet(self, pkt):
+        try:
+            # late import تا اگر scapy نیست، اپ بدون learner بالا بیاید
+            from scapy.layers.inet import TCP, IP
+            from scapy.layers.inet6 import IPv6
+            if not pkt.haslayer(TCP):
+                return
+            tcp = pkt[TCP]
+            if tcp.dport != 443:
+                return
+            payload = bytes(tcp.payload or b"")
+            if not payload:
+                return
+            host = _extract_sni_from_clienthello(payload)
+            if not host:
+                return
+                
+            fam = None
+            dst_ip = None
+            if IP in pkt:
+                fam = "v4"; dst_ip = pkt[IP].dst
+            elif IPv6 in pkt:
+                fam = "v6"; dst_ip = pkt[IPv6].dst
+    
+            # ★ NEW: همیشه لاگ کن (حتی اگر در لیست مسدودی match نشود)
+            iface_name = getattr(pkt, "sniffed_on", None)
+            _append_sni_log(
+                kind="sni",
+                host=host,
+                dst_ip=dst_ip,
+                fam=fam,
+                base=None,               # فعلاً خالی؛ اگر match شد پایین دوباره با base واقعی لاگ می‌کنیم (اختیاری)
+                iface=iface_name,
+            )
+                
+            rec = self._match_any_blocked(host)
+            if not rec:
+                return
+            _append_sni_log(
+                kind="sni",
+                host=host,
+                dst_ip=dst_ip,
+                fam=fam,
+                base=(rec or {}).get("pattern"),
+                iface=iface_name,
+            )
+    
+            if not dst_ip:
+                return
+                
+                
+            # مقصد را در بیاور (v4 یا v6)
+            fam = None
+            dst_ip = None
+            if IP in pkt:
+                fam = "v4"; dst_ip = pkt[IP].dst
+            elif IPv6 in pkt:
+                fam = "v6"; dst_ip = pkt[IPv6].dst
+            if not dst_ip:
+                return
+
+            # انتخاب ست درست با توجه به page-mode و show_page
+            use_page = bool(rec.get("show_page") and PAGE_MODE_ENABLED)
+            setname = {
+                ("v4", False): IPSET4,
+                ("v6", False): IPSET6,
+                ("v4", True):  IPSET4P,
+                ("v6", True):  IPSET6P,
+            }[(fam, use_page)]
+
+            # اضافه به ipset
+            _run_root(["ipset","add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+
+            # به realized رکورد هم اضافه کن (برای UI)
+            key = "v4" if fam == "v4" else "v6"
+            try:
+                with filters.lock:
+                    rr = filters.items.get(rec["id"])
+                    if rr:
+                        arr = rr.setdefault("realized", {}).setdefault(key, [])
+                        if dst_ip not in arr:
+                            arr.append(dst_ip)
+                        filters.flush()
+            except Exception:
+                pass
+
+        except Exception as e:
+            print("[netdash] SNI learner error:", e)
+
+    def start(self):
+        if not SNI_LEARN_ENABLED:
+            print("[netdash] SNI learner disabled (NETDASH_SNI_LEARN=0)")
+            return
+        try:
+            from scapy.all import sniff
+        except Exception as e:
+            print("[netdash] SNI learner disabled: scapy not available:", e)
+            return
+
+        self.running = True
+        def run():
+            flt = "tcp dst port 443"
+            kwargs = {"filter": flt, "prn": self._handle_packet, "store": False}
+            if self.ifaces:
+                kwargs["iface"] = self.ifaces  # لیست یا تک‌نام
+            print(f"[netdash] SNI learner started on: {self.ifaces or 'ALL'}")
+            try:
+                sniff(**kwargs)
+            except Exception as e:
+                print("[netdash] SNI learner stopped:", e)
+        threading.Thread(target=run, daemon=True).start()
+
+
+
 
 filters = FilterStore(FILTERS_FILE)
 
+try:
+    sni_learner = SNILearner(ifaces=SNI_LEARN_IFACES or None)
+    sni_learner.start()
+except Exception as _e:
+    print("[netdash] cannot start SNI learner:", _e)
+    
 #mohamamd#
 def _tc_bin():
     for p in ("/sbin/tc","/usr/sbin/tc","/usr/bin/tc","tc"):
@@ -959,15 +1514,36 @@ def _tc_bin():
     return "tc"
 
 def tc_status(iface):
+    res = {
+        "up":   {"active": False, "rate_mbit": None},
+        "down": {"active": False, "rate_mbit": None},
+    }
     try:
-        out = subprocess.check_output([_tc_bin(), "qdisc", "show", "dev", iface], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output([_tc_bin(), "qdisc", "show", "dev", iface],
+                                      text=True, stderr=subprocess.DEVNULL)
+        if " tbf " in out or out.strip().startswith("qdisc tbf"):
+            m = re.search(r"rate\s+([0-9.]+)Mbit", out)
+            res["up"]["active"] = True
+            res["up"]["rate_mbit"] = float(m.group(1)) if m else None
     except Exception:
-        return {"active": False, "algo": None, "rate_mbit": None}
-    if " tbf " in out or out.strip().startswith("qdisc tbf"):
-        m = re.search(r"rate\s+([0-9.]+)Mbit", out)
-        rate = float(m.group(1)) if m else None
-        return {"active": True, "algo": "tbf", "rate_mbit": rate}
-    return {"active": False, "algo": None, "rate_mbit": None}
+        pass
+    # IFB برای دانلود
+    ifb = _ifb_name(iface)
+    try:
+        out2 = subprocess.check_output([_tc_bin(), "qdisc", "show", "dev", ifb],
+                                       text=True, stderr=subprocess.DEVNULL)
+        if " tbf " in out2 or out2.strip().startswith("qdisc tbf"):
+            m2 = re.search(r"rate\s+([0-9.]+)Mbit", out2)
+            res["down"]["active"] = True
+            res["down"]["rate_mbit"] = float(m2.group(1)) if m2 else None
+    except Exception:
+        pass
+
+    any_active = res["up"]["active"] or res["down"]["active"]
+    if any_active:
+        return {"active": True, "algo": "tbf", "rate_mbit": res["up"]["rate_mbit"] or res["down"]["rate_mbit"], "detail": res}
+    return {"active": False, "algo": None, "rate_mbit": None, "detail": res}
+
 
 def tc_limit(iface, rate_mbit, burst_kbit=32, latency_ms=400):
     cmd = [_tc_bin(), "qdisc", "replace", "dev", iface, "root",
@@ -987,6 +1563,82 @@ def tc_clear(iface):
     except subprocess.CalledProcessError:
         pass
 
+# === Helpers for download shaping via IFB ===
+def _safe_ifname(s):
+    return re.sub(r'[^a-zA-Z0-9_.-]+', '-', str(s))
+
+def _ifb_name(iface):
+    # IFNAMSIZ=16 => حداکثر 15 کاراکتر
+    base = _safe_ifname(iface)
+    name = f"ifb-{base}"
+    return name[:15]
+
+def _ip_run(args):
+    ipbin = _find_ip_binary()
+    cmd = [ipbin] + list(args)
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def _ensure_ifb(iface):
+    ifb = _ifb_name(iface)
+    # اگر نبود، بساز و Up کن
+    try:
+        _ip_run(["link", "show", ifb])
+    except subprocess.CalledProcessError:
+        try:
+            # اگر کرنل‌ماژول ifb لود نیست، تلاش کن
+            cmd = ["modprobe", "ifb"]
+            if os.geteuid() != 0: cmd = ["sudo","-n"] + cmd
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        _ip_run(["link", "add", ifb, "type", "ifb"])
+    _ip_run(["link", "set", ifb, "up"])
+    return ifb
+
+def tc_limit_down(iface, rate_mbit, burst_kbit=32, latency_ms=400):
+    """
+    دانلود را با IFB محدود می‌کند: ingress روی iface و TBF روی ifb-<iface>
+    """
+    ifb = _ensure_ifb(iface)
+    # ingress روی اینترفیس اصلی
+    cmd1 = [_tc_bin(), "qdisc", "replace", "dev", iface, "ingress"]
+    # redirect همه ingress به ifb
+    cmd2 = [_tc_bin(), "filter", "add", "dev", iface, "parent", "ffff:",
+            "protocol", "all", "u32", "match", "u32", "0", "0",
+            "action", "mirred", "egress", "redirect", "dev", ifb]
+    # TBF روی ifb (دانلود)
+    cmd3 = [_tc_bin(), "qdisc", "replace", "dev", ifb, "root", "tbf",
+            "rate", f"{float(rate_mbit)}mbit",
+            "burst", f"{int(burst_kbit)}kbit",
+            "latency", f"{int(latency_ms)}ms"]
+    for c in (cmd1, cmd2, cmd3):
+        if os.geteuid() != 0: c = ["sudo","-n"] + c
+        subprocess.check_call(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def tc_clear_down(iface):
+    ifb = _ifb_name(iface)
+    # پاک‌کردن ingress و TBF روی ifb
+    for c in (
+        [_tc_bin(), "qdisc", "del", "dev", iface, "ingress"],
+        [_tc_bin(), "qdisc", "del", "dev", ifb, "root"],
+    ):
+        if os.geteuid() != 0: c = ["sudo","-n"] + c
+        try:
+            subprocess.check_call(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            pass
+    # اختیاری: حذف ifb
+    try:
+        _ip_run(["link", "set", ifb, "down"])
+        _ip_run(["link", "del", ifb])
+    except Exception:
+        pass
+
+
+
+
 # ------------------ UI ------------------
 HTML = r"""
 <!doctype html>
@@ -995,317 +1647,17 @@ HTML = r"""
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NetDash - داشبورد ترافیک شبکه</title>
-  <script src="https://cdn.tailwindcss.com">
-// === Keep pause/resume button next to status badges ===
-(function(){
-  function placeCtrlNextToState(card){
-    try{
-      const ctrl = card.querySelector('.ctrl-btn');
-      if(!ctrl) return;
-      // likely row for badges:
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-        if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-          try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-        }
-        badgeRow.insertBefore(ctrl, last.nextSibling);
-        ctrl.classList.add('badge-btn','shrink-0');
-      }
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeCtrlNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
 
-
-// === Keep shape (محدودیت) button next to status badges and color it red ===
-(function(){
-  function placeShapeNextToState(card){
-    try{
-      const shape = card.querySelector('.shape-btn');
-      if(!shape) return;
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      // place right after last state
-      if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-        if (shape.parentElement && shape.parentElement !== badgeRow){
-          try{ shape.parentElement.removeChild(shape); }catch{}
-        }
-        badgeRow.insertBefore(shape, last.nextSibling);
-        shape.classList.add('badge-btn','shrink-0');
-      }
-      // enforce red/white style regardless of class toggling
-      shape.classList.add('b-shape'); // ensure one of the classes is present
-      shape.classList.remove('b-warn'); // remove old yellow if present
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeShapeNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
-
-
-// === NetDash helper: place control & shape buttons next to status badges (one-shot; called on load & after render) ===
-function NetdashPlaceButtons(){
-  try{
-    document.querySelectorAll('.card').forEach(card => {
-      // ctrl-btn
-      try{
-        const ctrl = card.querySelector('.ctrl-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (ctrl && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-            if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-              try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-            }
-            badgeRow.insertBefore(ctrl, last.nextSibling);
-            ctrl.classList.add('badge-btn','shrink-0');
-          }
-        }
-      }catch(e){ console.error('ctrl-btn move error', e); }
-      // shape-btn
-      try{
-        const shape = card.querySelector('.shape-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (shape && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-            if (shape.parentElement && shape.parentElement !== badgeRow){
-              try{ shape.parentElement.removeChild(shape); }catch{}
-            }
-            badgeRow.insertBefore(shape, last.nextSibling);
-            shape.classList.add('badge-btn','shrink-0');
-          }
-          // force red/white style
-          shape.classList.add('b-shape');
-          shape.classList.remove('b-warn');
-        }
-      }catch(e){ console.error('shape-btn move error', e); }
-    });
-  }catch(e){}
-}
-window.addEventListener('load', NetdashPlaceButtons);
-window.addEventListener('load', initStatWindowSelector);
-
-</script>
+  <!-- Tailwind config باید قبل از خود Tailwind باشد -->
   <script>
     tailwind.config = {
       darkMode: 'class',
       theme: { extend: { fontFamily: { sans: ['Vazirmatn', 'Inter', 'ui-sans-serif', 'system-ui'] } } }
     }
-  
-// === Keep pause/resume button next to status badges ===
-(function(){
-  function placeCtrlNextToState(card){
-    try{
-      const ctrl = card.querySelector('.ctrl-btn');
-      if(!ctrl) return;
-      // likely row for badges:
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-        if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-          try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-        }
-        badgeRow.insertBefore(ctrl, last.nextSibling);
-        ctrl.classList.add('badge-btn','shrink-0');
-      }
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeCtrlNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-
-// === Keep shape (محدودیت) button next to status badges and color it red ===
-(function(){
-  function placeShapeNextToState(card){
-    try{
-      const shape = card.querySelector('.shape-btn');
-      if(!shape) return;
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      // place right after last state
-      if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-        if (shape.parentElement && shape.parentElement !== badgeRow){
-          try{ shape.parentElement.removeChild(shape); }catch{}
-        }
-        badgeRow.insertBefore(shape, last.nextSibling);
-        shape.classList.add('badge-btn','shrink-0');
-      }
-      // enforce red/white style regardless of class toggling
-      shape.classList.add('b-shape'); // ensure one of the classes is present
-      shape.classList.remove('b-warn'); // remove old yellow if present
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeShapeNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
-
-
-// === NetDash helper: place control & shape buttons next to status badges (one-shot; called on load & after render) ===
-function NetdashPlaceButtons(){
-  try{
-    document.querySelectorAll('.card').forEach(card => {
-      // ctrl-btn
-      try{
-        const ctrl = card.querySelector('.ctrl-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (ctrl && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-            if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-              try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-            }
-            badgeRow.insertBefore(ctrl, last.nextSibling);
-            ctrl.classList.add('badge-btn','shrink-0');
-          }
-        }
-      }catch(e){ console.error('ctrl-btn move error', e); }
-      // shape-btn
-      try{
-        const shape = card.querySelector('.shape-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (shape && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-            if (shape.parentElement && shape.parentElement !== badgeRow){
-              try{ shape.parentElement.removeChild(shape); }catch{}
-            }
-            badgeRow.insertBefore(shape, last.nextSibling);
-            shape.classList.add('badge-btn','shrink-0');
-          }
-          // force red/white style
-          shape.classList.add('b-shape');
-          shape.classList.remove('b-warn');
-        }
-      }catch(e){ console.error('shape-btn move error', e); }
-    });
-  }catch(e){}
-}
-window.addEventListener('load', NetdashPlaceButtons);
-window.addEventListener('load', initStatWindowSelector);
-
-</script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js">
-// === Keep pause/resume button next to status badges ===
-(function(){
-  function placeCtrlNextToState(card){
-    try{
-      const ctrl = card.querySelector('.ctrl-btn');
-      if(!ctrl) return;
-      // likely row for badges:
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-        if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-          try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-        }
-        badgeRow.insertBefore(ctrl, last.nextSibling);
-        ctrl.classList.add('badge-btn','shrink-0');
-      }
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeCtrlNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
-
-
-// === Keep shape (محدودیت) button next to status badges and color it red ===
-(function(){
-  function placeShapeNextToState(card){
-    try{
-      const shape = card.querySelector('.shape-btn');
-      if(!shape) return;
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      // place right after last state
-      if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-        if (shape.parentElement && shape.parentElement !== badgeRow){
-          try{ shape.parentElement.removeChild(shape); }catch{}
-        }
-        badgeRow.insertBefore(shape, last.nextSibling);
-        shape.classList.add('badge-btn','shrink-0');
-      }
-      // enforce red/white style regardless of class toggling
-      shape.classList.add('b-shape'); // ensure one of the classes is present
-      shape.classList.remove('b-warn'); // remove old yellow if present
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeShapeNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
-
-
-// === NetDash helper: place control & shape buttons next to status badges (one-shot; called on load & after render) ===
-function NetdashPlaceButtons(){
-  try{
-    document.querySelectorAll('.card').forEach(card => {
-      // ctrl-btn
-      try{
-        const ctrl = card.querySelector('.ctrl-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (ctrl && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-            if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-              try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-            }
-            badgeRow.insertBefore(ctrl, last.nextSibling);
-            ctrl.classList.add('badge-btn','shrink-0');
-          }
-        }
-      }catch(e){ console.error('ctrl-btn move error', e); }
-      // shape-btn
-      try{
-        const shape = card.querySelector('.shape-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (shape && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-            if (shape.parentElement && shape.parentElement !== badgeRow){
-              try{ shape.parentElement.removeChild(shape); }catch{}
-            }
-            badgeRow.insertBefore(shape, last.nextSibling);
-            shape.classList.add('badge-btn','shrink-0');
-          }
-          // force red/white style
-          shape.classList.add('b-shape');
-          shape.classList.remove('b-warn');
-        }
-      }catch(e){ console.error('shape-btn move error', e); }
-    });
-  }catch(e){}
-}
-window.addEventListener('load', NetdashPlaceButtons);
-window.addEventListener('load', initStatWindowSelector);
-
-</script>
   <style>
     .card { border-radius: 1rem; box-shadow: 0 2px 24px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.06); }
     .k { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; direction:ltr }
@@ -1313,23 +1665,26 @@ window.addEventListener('load', initStatWindowSelector);
     .b-up { background:#d1fae5; color:#065f46; }
     .b-down { background:#fee2e2; color:#991b1b; }
     .b-unk { background:#fde68a; color:#92400e; }
-    .badge-btn { cursor:pointer; user-select:none; border: none; }
+    .badge-btn { cursor:pointer; user-select:none; border:none; display:inline-flex; align-items:center; justify-content:center; white-space:nowrap }
     .badge-btn:disabled { opacity:.75; cursor:not-allowed; }
     .ltr { direction:ltr }
-  .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ltr{direction:ltr}
-/* To enable two-line clamp, replace white-space with below:
-.name{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:normal}
-*/
-.shape-btn{min-width:unset}
-.shape-btn.b-warn{background:#fde68a;color:#4b3b05;border:1px solid #f59e0b}
-.shape-btn.b-clear{background:#fecaca;color:#7f1d1d;border:1px solid #ef4444}
-.b-shape{background:#dbeafe;color:#1e3a8a;border:1px solid #60a5fa}
-.b-clear{background:#fecaca;color:#7f1d1d;border:1px solid #ef4444}
-.name{white-space:normal !important;overflow-wrap:anywhere;word-break:break-word;text-overflow:clip !important}
-.b-shape,.b-clear{background:#ef4444 !important;color:#ffffff !important;border:1px solid #b91c1c !important}
-.badge-btn{display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}
-</style>
+
+    .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    /* اگر می‌خواهی دو خطی شود از این استفاده کن:
+    .name{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:normal}
+    */
+    .name{white-space:normal !important;overflow-wrap:anywhere;word-break:break-word;text-overflow:clip !important}
+
+    /* دکمه‌های محدودیت — دو حالت متمایز */
+    .b-shape{background:#dbeafe;color:#1e3a8a;border:1px solid #60a5fa}   /* آبی: «اعمال محدودیت» */
+    .b-clear{background:#fecaca;color:#7f1d1d;border:1px solid #ef4444}   /* قرمز روشن: «حذف محدودیت» */
+
+    /* ⛔️ این خط مشکل‌ساز را عمداً نداریم:
+       .b-shape,.b-clear{background:#ef4444 !important;color:#ffffff !important;border:1px solid #b91c1c !important}
+    */
+  </style>
 </head>
+
 <body class="bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
   <div class="max-w-7xl mx-auto p-4 sm:p-6">
     <div class="flex flex-wrap items-center justify-between gap-3 mb-6">
@@ -1341,9 +1696,7 @@ window.addEventListener('load', initStatWindowSelector);
           <option value="daily">روزانه</option>
           <option value="monthly">ماهانه</option>
         </select>
-        <select id="statSel" class="px-2 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" title="پنجره آماری">
-          <!-- پر می‌شود با JS براساس MAX_POINTS -->
-        </select>
+        <select id="statSel" class="px-2 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" title="پنجره آماری"></select>
         <button id="reportBtn" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">گزارش</button>
       </div>
     </div>
@@ -1370,12 +1723,13 @@ window.addEventListener('load', initStatWindowSelector);
       </div>
       <div id="ping-chips" class="flex flex-wrap gap-2"></div>
     </div>
+
     <div class="card p-4 bg-white dark:bg-gray-800 mb-4">
       <div class="flex items-center justify-between mb-3">
         <div class="font-semibold">مسدودسازی آدرس‌ها (بلاک‌لیست)</div>
         <div class="text-xs opacity-70">قوانین سطح سیستم (iptables)</div>
       </div>
-    
+
       <!-- فرم -->
       <div class="grid grid-cols-1 md:grid-cols-5 gap-2 items-end">
         <div>
@@ -1403,14 +1757,14 @@ window.addEventListener('load', initStatWindowSelector);
         <div>
           <button id="flt-add" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm w-full">افزودن به بلاک‌لیست</button>
         </div>
-    
+
         <!-- چک‌باکس صفحهٔ مسدودسازی -->
         <div class="md:col-span-5 flex items-center gap-2">
           <input id="flt-page" type="checkbox" class="h-4 w-4">
           <label for="flt-page" class="text-sm opacity-80">نمایش صفحهٔ مسدودسازی (فقط HTTP)</label>
         </div>
       </div>
-    
+
       <!-- لیست -->
       <div class="mt-4">
         <div class="text-sm opacity-70 mb-2">موارد مسدود‌شده</div>
@@ -1430,10 +1784,7 @@ window.addEventListener('load', initStatWindowSelector);
         </div>
       </div>
     </div>
-          </table>
-        </div>
-      </div>
-    </div>
+
     <div id="cards" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4"></div>
   </div>
 
@@ -1443,9 +1794,7 @@ window.addEventListener('load', initStatWindowSelector);
         <div class="min-w-0 flex flex-col gap-1">
           <div class="grid grid-cols-[1fr_auto] items-center gap-2">
             <div class="font-bold text-lg k name truncate flex-1 min-w-0 ltr"></div>
-            <button class="ctrl-btn hidden badge badge-btn b-up shrink-0">
-              <span class="btn-label">توقف</span>
-            </button>
+            <button class="ctrl-btn hidden badge badge-btn b-up shrink-0"><span class="btn-label">توقف</span></button>
             <button class="shape-btn hidden badge badge-btn b-unk shrink-0"><span class="shape-label">محدودیت</span></button>
           </div>
           <div class="text-xs opacity-80 flags"></div>
@@ -1466,19 +1815,38 @@ window.addEventListener('load', initStatWindowSelector);
     </div>
   </template>
 
+  <!-- Modal محدودیت -->
+  <div id="shape-modal" class="fixed inset-0 z-50 hidden">
+    <div class="absolute inset-0 bg-black/40"></div>
+    <div class="absolute inset-0 flex items-center justify-center p-4">
+      <div class="w-full max-w-md card bg-white dark:bg-gray-800 p-4 rounded-xl">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-bold">محدودیت پهنای‌باند</h3>
+          <button id="shape-close" class="text-sm opacity-70">✕</button>
+        </div>
+        <div class="text-xs opacity-70 mb-3">اینترفیس: <span id="shape-iface" class="k"></span></div>
+        <div class="grid gap-3">
+          <div class="flex gap-4">
+            <label class="flex items-center gap-2"><input type="radio" name="shape-dir" value="up" checked> آپلود</label>
+            <label class="flex items-center gap-2"><input type="radio" name="shape-dir" value="down"> دانلود</label>
+          </div>
+          <div>
+            <label class="text-xs opacity-70">سقف سرعت (Mbps)</label>
+            <input id="shape-rate" type="number" min="0.1" step="0.1"
+                   class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm w-full">
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button id="shape-apply" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">اعمال</button>
+            <button id="shape-clear" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">حذف محدودیت</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- اسکریپت یکپارچه -->
   <script>
-
-    // Friendly middle-ellipsis for long interface names
-    function shortName(name){
-      try{
-        const s = String(name||''); 
-        const max = 22; // target length
-        if (s.length <= max) return s;
-        const head = 12, tail = 8;
-        return s.slice(0, head) + '…' + s.slice(-tail);
-      }catch{ return name; }
-    }
-
+    // اگر Chart.js نبود، مینی‌چارت ساده بساز
     (function ensureChart(){
       if (window.Chart) return;
       function MiniChart(ctx, config){
@@ -1499,8 +1867,7 @@ window.addEventListener('load', initStatWindowSelector);
             });
             g.stroke();
           };
-          draw(ds0, "#3b82f6");
-          draw(ds1, "#10b981");
+          draw(ds0, "#3b82f6"); draw(ds1, "#10b981");
         };
       }
       window.Chart = function(ctx, config){ return new MiniChart(ctx, config); };
@@ -1509,146 +1876,12 @@ window.addEventListener('load', initStatWindowSelector);
     const MAX_POINTS = {{max_points}};
     const CONTROL_TOKEN = {{ token|tojson }};
     const cards = new Map();
+    let STAT_WINDOW = parseInt(localStorage.getItem('netdash-stat-window') || '60', 10);
+    if (isNaN(STAT_WINDOW) || STAT_WINDOW <= 0) STAT_WINDOW = Math.min(60, MAX_POINTS);
+    let LAST_PERIOD = {};   // name -> {rx, tx}
+    let PERIOD_SCOPE = 'daily';
 
-let STAT_WINDOW = parseInt(localStorage.getItem('netdash-stat-window') || '60', 10);
-if (isNaN(STAT_WINDOW) || STAT_WINDOW <= 0) STAT_WINDOW = Math.min(60, MAX_POINTS);
-
-function initStatWindowSelector(){
-  const sel = document.getElementById('statSel');
-  if (!sel) return;
-  // Build options dynamically from MAX_POINTS
-  const opts = [];
-  const candidates = [30, 60, 120, 300, 900];
-  candidates.forEach(v => { if (v <= MAX_POINTS) opts.push(v); });
-  if (!opts.length) opts.push(Math.min(60, MAX_POINTS));
-  sel.innerHTML = opts.map(v => {
-    const lbl = v>=60 ? (v%60===0 ? (v/60)+'m' : (Math.floor(v/60)+'m'+(v%60)+'s')) : (v+'s');
-    return `<option value="${v}">پنجره: ${lbl}</option>`;
-  }).join('');
-  // select current
-  sel.value = String(STAT_WINDOW);
-  sel.addEventListener('change', ()=>{
-    STAT_WINDOW = parseInt(sel.value,10)||60;
-    localStorage.setItem('netdash-stat-window', String(STAT_WINDOW));
-    // refresh stats on all cards immediately
-    try{ for(const c of cards.values()) updateStatsForCard(c); }catch{}
-  });
-}
-
-let LAST_PERIOD = {};   // name -> {rx, tx}
-let PERIOD_SCOPE = 'daily';  // current selected scope
-
-
-async function populateFilterIfaces(){
-  try{
-    const res = await fetch('/api/interfaces',{cache:'no-store'});
-    const ifs = await res.json();
-    const sel = document.getElementById('flt-iface');
-    if(!sel) return;
-    const cur = sel.value;
-    sel.innerHTML = `<option value="">همه</option>` + ifs.map(x=>`<option value="${x.name}">${x.name}</option>`).join('');
-    if (Array.from(sel.options).some(o=>o.value===cur)) sel.value = cur;
-  }catch(e){}
-}
-
-async function refreshFilters(){
-  try{
-    const headers = CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {};
-    const res = await fetch('/api/filters', {headers, cache:'no-store'});
-    if(!res.ok){ return; }
-    const data = await res.json();
-    const tbody = document.getElementById('flt-tbody');
-    if(!tbody) return;
-    tbody.innerHTML = '';
-    for(const it of (data.items||[])){
-      const pp = (it.proto||'all') + (it.port? (':'+it.port):'');
-      const resolved = []
-        .concat((it.realized&&it.realized.v4)||[])
-        .concat((it.realized&&it.realized.v6)||[]);
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td class="py-1 pr-4 k">${it.pattern}</td>
-        <td class="py-1 pr-4 k">${it.iface || '—'}</td>
-        <td class="py-1 pr-4 k">${pp}</td>
-        <td class="py-1 pr-4 k">${resolved.length? resolved.join(', '): '—'}</td>
-        <td class="py-1 pr-4">
-          <button class="badge badge-btn b-down" data-id="${it.id}">حذف</button>
-        </td>`;
-      tr.querySelector('button').onclick = async (ev)=>{
-        if(!confirm('این مورد از بلاک‌لیست حذف شود؟')) return;
-        const id = ev.currentTarget.getAttribute('data-id');
-        try{
-          const res = await fetch('/api/filters/'+encodeURIComponent(id), {
-            method:'DELETE',
-            headers: CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {}
-          });
-          if(!res.ok){ alert('حذف نشد'); return; }
-          refreshFilters();
-        }catch(e){ alert('خطا در حذف: '+e); }
-      };
-      tbody.appendChild(tr);
-    }
-  }catch(e){}
-}
-
-async function addFilterFromForm(){
-  const pattern = document.getElementById('flt-pattern').value.trim();
-  const show_page = document.getElementById('flt-page').checked;
-
-  const iface   = document.getElementById('flt-iface').value.trim();
-  const proto   = document.getElementById('flt-proto').value.trim() || 'all';
-  const portVal = document.getElementById('flt-port').value.trim();
-  const port    = portVal ? parseInt(portVal,10) : null;
-
-  if(!pattern){ alert('دامنه یا IP/CIDR را وارد کنید'); return; }
-  const btn = document.getElementById('flt-add');
-  const old = btn.textContent; btn.textContent='در حال افزودن...'; btn.setAttribute('disabled','disabled');
-  try{
-    const headers = {"Content-Type":"application/json"};
-    if (CONTROL_TOKEN) headers["X-Auth-Token"] = CONTROL_TOKEN;
-    const res = await fetch('/api/filters', {
-      method:'POST',
-      headers,
-      body: JSON.stringify({pattern, iface: iface||null, proto, port, show_page})
-
-    });
-    if(!res.ok){
-      const t = await res.text();
-      alert('عدم موفقیت: '+ t);
-    } else {
-      document.getElementById('flt-pattern').value='';
-      document.getElementById('flt-port').value='';
-      refreshFilters();
-    }
-  }catch(e){ alert('خطا: '+e); }
-  finally{ btn.textContent=old; btn.removeAttribute('disabled'); }
-}
-
-window.addEventListener('load', ()=>{
-  try{
-    populateFilterIfaces();
-    refreshFilters();
-    const btn = document.getElementById('flt-add');
-    if(btn) btn.addEventListener('click', addFilterFromForm);
-    setInterval(populateFilterIfaces, 30000);
-    setInterval(refreshFilters, 15000);
-  }catch(e){}
-});
-
-
-
-
-function applyPeriodToCards(){
-  const title = (PERIOD_SCOPE==='daily'?'امروز':'ماه جاری');
-  for (const [name, vals] of Object.entries(LAST_PERIOD)){
-    const card = cards.get(name);
-    if(!card) continue;
-    const rx = fmtBytes(vals.rx||0);
-    const tx = fmtBytes(vals.tx||0);
-    card.el.querySelector('.period').textContent = `${title}: DL ${rx} | UL ${tx}`;
-  }
-}
-
+    // ---------- Utilities ----------
     function fmtBytes(x){
       const units = ["B","KB","MB","GB","TB","PB"];
       let i=0, v=Number(x);
@@ -1661,7 +1894,6 @@ function applyPeriodToCards(){
       if(state==="DOWN") return {text:"پایین", cls:"badge b-down"};
       return {text: "نامشخص", cls:"badge b-unk"};
     }
-
     function makeChart(canvas){
       const ctx = canvas.getContext('2d');
       return new Chart(ctx, {
@@ -1677,27 +1909,133 @@ function applyPeriodToCards(){
         }
       });
     }
-
     function styleButton(btn, isUp){
-      btn.classList.remove('hidden');
-      btn.classList.remove('b-up','b-down');
-      if (isUp){
-        btn.classList.add('b-down');
-        btn.querySelector('.btn-label').textContent = 'توقف';
-      } else {
-        btn.classList.add('b-up');
-        btn.querySelector('.btn-label').textContent = 'ازسرگیری';
+      btn.classList.remove('hidden','b-up','b-down');
+      if (isUp){ btn.classList.add('b-down'); btn.querySelector('.btn-label').textContent = 'توقف'; }
+      else { btn.classList.add('b-up'); btn.querySelector('.btn-label').textContent = 'ازسرگیری'; }
+    }
+    function updateStatsForCard(cardObj){
+      const ch = cardObj.chart;
+      const W = Math.max(1, Math.min(STAT_WINDOW, MAX_POINTS));
+      const rx = ch.data.datasets[0].data.slice(-W).map(Number);
+      const tx = ch.data.datasets[1].data.slice(-W).map(Number);
+      const mean = a => a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
+      const percentile = (arr,p)=>{ if(!arr.length) return 0; const s=arr.slice().sort((a,b)=>a-b); const i=Math.floor(p*(s.length-1)); return s[Math.min(s.length-1,Math.max(0,i))]; };
+      const dl = {mu: mean(rx), mx: (rx.length? Math.max(...rx):0), p95: percentile(rx,0.95)};
+      const ul = {mu: mean(tx), mx: (tx.length? Math.max(...tx):0), p95: percentile(tx,0.95)};
+      const line = `DL μ/max/۹۵٪: ${dl.mu.toFixed(1)}/${dl.mx.toFixed(1)}/${dl.p95.toFixed(1)} | UL μ/max/۹۵٪: ${ul.mu.toFixed(1)}/${ul.mx.toFixed(1)}/${ul.p95.toFixed(1)} [${W}s]`;
+      cardObj.el.querySelector('.stats').textContent = line;
+    }
+    function applyPeriodToCards(){
+      const title = (PERIOD_SCOPE==='daily'?'امروز':'ماه جاری');
+      for (const [name, vals] of Object.entries(LAST_PERIOD)){
+        const card = cards.get(name);
+        if(!card) continue;
+        const rx = fmtBytes(vals.rx||0);
+        const tx = fmtBytes(vals.tx||0);
+        card.el.querySelector('.period').textContent = `${title}: DL ${rx} | UL ${tx}`;
       }
     }
 
-    function mean(arr){ if(arr.length===0) return 0; return arr.reduce((a,b)=>a+b,0)/arr.length; }
-    function percentile(arr, p){
-      if(arr.length===0) return 0;
-      const s = arr.slice().sort((a,b)=>a-b);
-      const idx = Math.min(s.length-1, Math.max(0, Math.floor(p*(s.length-1))));
-      return s[idx];
+    // ---------- Reposition buttons next to badges ----------
+    function placeCtrlNextToState(card){
+      try{
+        const ctrl = card.querySelector('.ctrl-btn'); if(!ctrl) return;
+        const badgeRow = card.querySelector('.badge.state')?.parentElement; if(!badgeRow) return;
+        const states = card.querySelectorAll('.badge.state'); if(!states.length) return;
+        const last = states[states.length-1];
+        if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
+          if (ctrl.parentElement && ctrl.parentElement !== badgeRow){ try{ ctrl.parentElement.removeChild(ctrl); }catch{} }
+          badgeRow.insertBefore(ctrl, last.nextSibling);
+          ctrl.classList.add('badge-btn','shrink-0');
+        }
+      }catch(e){}
     }
-    const WINDOW = Math.min(60, MAX_POINTS);
+    function placeShapeNextToState(card){
+      try{
+        const shape = card.querySelector('.shape-btn'); if(!shape) return;
+        const badgeRow = card.querySelector('.badge.state')?.parentElement; if(!badgeRow) return;
+        const states = card.querySelectorAll('.badge.state'); if(!states.length) return;
+        const last = states[states.length-1];
+        if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
+          if (shape.parentElement && shape.parentElement !== badgeRow){ try{ shape.parentElement.removeChild(shape); }catch{} }
+          badgeRow.insertBefore(shape, last.nextSibling);
+          shape.classList.add('badge-btn','shrink-0');
+        }
+        shape.classList.add('b-shape');  // استایل آبی
+        shape.classList.remove('b-warn');
+      }catch(e){}
+    }
+    function NetdashPlaceButtons(){
+      try{ document.querySelectorAll('.card').forEach(card=>{ placeCtrlNextToState(card); placeShapeNextToState(card); }); }catch(e){}
+    }
+
+    // ---------- Modal handlers ----------
+    let SHAPE_IFACE = null;
+    function openShapeModal(iface, detail){
+      try{
+        SHAPE_IFACE = iface;
+        document.getElementById('shape-iface').textContent = iface;
+        document.getElementById('shape-rate').value = '';
+        document.getElementById('shape-modal').classList.remove('hidden');
+        if (detail && detail.down && detail.down.active){
+          document.querySelector('input[name="shape-dir"][value="down"]').checked = true;
+        } else {
+          document.querySelector('input[name="shape-dir"][value="up"]').checked = true;
+        }
+      }catch(e){}
+    }
+    function closeShapeModal(){
+      try{ document.getElementById('shape-modal').classList.add('hidden'); SHAPE_IFACE = null; }catch(e){}
+    }
+    function bindShapeModalHandlers(){
+      const closeBtn = document.getElementById('shape-close');
+      if (closeBtn) closeBtn.onclick = closeShapeModal;
+
+      const applyBtn = document.getElementById('shape-apply');
+      if (applyBtn) applyBtn.onclick = async ()=>{
+        const rate = parseFloat(String(document.getElementById('shape-rate').value).replace(',','.'));
+        if (!(rate>0)){ alert('مقدار نامعتبر'); return; }
+        const dir = document.querySelector('input[name="shape-dir"]:checked').value;
+        const headers = Object.assign({"Content-Type":"application/json"}, CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {});
+        try{
+          const res = await fetch(`/api/shape/${encodeURIComponent(SHAPE_IFACE)}/limit`, { method:'POST', headers, body: JSON.stringify({rate_mbit: rate, direction: dir}) });
+          if(!res.ok){ alert('خطا در اعمال محدودیت'); return; }
+          closeShapeModal();
+          if (typeof loadInterfaces==='function') await loadInterfaces();
+        }catch(e){ alert('خطا: '+e); }
+      };
+
+      const clearBtn = document.getElementById('shape-clear');
+      if (clearBtn) clearBtn.onclick = async ()=>{
+        const dir = document.querySelector('input[name="shape-dir"]:checked').value;
+        const headers = Object.assign({"Content-Type":"application/json"}, CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {});
+        try{
+          const res = await fetch(`/api/shape/${encodeURIComponent(SHAPE_IFACE)}/clear`, { method:'POST', headers, body: JSON.stringify({direction: dir}) });
+          if(!res.ok){ alert('خطا در حذف محدودیت'); return; }
+          closeShapeModal();
+          if (typeof loadInterfaces==='function') await loadInterfaces();
+        }catch(e){ alert('خطا: '+e); }
+      };
+    }
+
+    // ---------- API/UI logic ----------
+    function initStatWindowSelector(){
+      const sel = document.getElementById('statSel');
+      if (!sel) return;
+      const opts = []; [30, 60, 120, 300, 900].forEach(v => { if (v <= MAX_POINTS) opts.push(v); });
+      if (!opts.length) opts.push(Math.min(60, MAX_POINTS));
+      sel.innerHTML = opts.map(v => {
+        const lbl = v>=60 ? (v%60===0 ? (v/60)+'m' : (Math.floor(v/60)+'m'+(v%60)+'s')) : (v+'s');
+        return `<option value="${v}">پنجره: ${lbl}</option>`;
+      }).join('');
+      sel.value = String(STAT_WINDOW);
+      sel.addEventListener('change', ()=>{
+        STAT_WINDOW = parseInt(sel.value,10)||60;
+        localStorage.setItem('netdash-stat-window', String(STAT_WINDOW));
+        try{ for(const c of cards.values()) updateStatsForCard(c); }catch{}
+      });
+    }
 
     async function controlIface(btn, name, action){
       const headers = CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {};
@@ -1709,9 +2047,7 @@ function applyPeriodToCards(){
       btn.setAttribute('disabled','disabled');
       btn.querySelector('.btn-label').textContent = 'در حال انجام...';
       try{
-        const res = await fetch(`/api/iface/${encodeURIComponent(name)}/${action}`, {
-          method: 'POST', headers
-        });
+        const res = await fetch(`/api/iface/${encodeURIComponent(name)}/${action}`, { method: 'POST', headers });
         if(!res.ok){
           const t = await res.text();
           alert(`انجام نشد: ${res.status} ${t}`);
@@ -1733,22 +2069,26 @@ function applyPeriodToCards(){
       wrap.innerHTML = '';
       cards.clear();
 
-      for(const it of ifaces){
+      for (const it of ifaces){
         const tpl = document.getElementById('card-template').content.cloneNode(true);
         const card = tpl.querySelector('.card');
         card.dataset.iface = it.name;
 
+        // نام
         card.querySelector('.name').textContent = it.name;
         card.querySelector('.name').setAttribute('title', it.name);
+
+        // وضعیت
         const b = badgeFor(it.state);
         const st = card.querySelector('.state');
         st.textContent = b.text;
         st.className = b.cls + " state";
 
+        // جزئیات
         const flags = (it.flags||[]).join(",");
-        const mac = it.mac ? (" | MAC: <span class='k'>" + it.mac + "</span>") : "";
+        const mac   = it.mac ? (" | MAC: <span class='k'>" + it.mac + "</span>") : "";
         card.querySelector('.flags').innerHTML = "پرچم‌ها: " + (flags || "هیچ");
-        card.querySelector('.meta').innerHTML = "MTU: " + (it.mtu ?? "-") + mac;
+        card.querySelector('.meta').innerHTML  = "MTU: " + (it.mtu ?? "-") + mac;
 
         const v4 = (it.addresses||[]).filter(a=>a.family==="inet").map(a=>a.cidr);
         const v6 = (it.addresses||[]).filter(a=>a.family==="inet6").map(a=>a.cidr);
@@ -1758,105 +2098,53 @@ function applyPeriodToCards(){
         card.querySelector('.addrs').innerHTML = addrHTML || "<span class='opacity-60'>بدون IP</span>";
 
         const li = it.link || {};
-        const speedText = (li.speed !== null && li.speed !== undefined) ? (li.speed + " Mb/s") : "نامشخص";
+        const speedText  = (li.speed !== null && li.speed !== undefined) ? (li.speed + " Mb/s") : "نامشخص";
         const duplexText = li.duplex ? li.duplex : "نامشخص";
-        const extra = it.kind ? (" | نوع: " + it.kind) : "";
+        const extra      = it.kind ? (" | نوع: " + it.kind) : "";
         card.querySelector('.linkinfo').innerHTML = "Link: <span class='k'>سرعت: " + speedText + " | دوبلکس: " + duplexText + extra + "</span>";
 
-        const btn = card.querySelector('.ctrl-btn');
+        // دکمهٔ توقف/ازسرگیری
+        const btn  = card.querySelector('.ctrl-btn');
         const isUp = !!it.is_up;
         styleButton(btn, isUp);
-
-        const sbtn = card.querySelector('.shape-btn');
-        const shaped = (it.shape && it.shape.active);
-        if (it.can_control){
-          sbtn.classList.remove('hidden');
-          sbtn.classList.remove('b-warn','b-clear','b-unk');
-          sbtn.classList.add(shaped ? 'b-clear' : 'b-warn');
-          sbtn.querySelector('.shape-label').textContent = shaped ? 'حذف محدودیت' : 'محدودیت';
-          sbtn.onclick = async ()=>{
-
-        // --- shape button next to state badges (safe DOM) ---
-        try{
-          let shapeBtn = card.querySelector('.shape-btn');
-          const firstState = card.querySelector('.badge.state');
-          if (!shapeBtn){
-            shapeBtn = document.createElement('button');
-            shapeBtn.className = 'shape-btn badge badge-btn shrink-0';
-            const span = document.createElement('span');
-            span.className = 'shape-label';
-            shapeBtn.appendChild(span);
-            if (firstState && firstState.parentElement){
-              firstState.parentElement.insertBefore(shapeBtn, firstState);
-            } else {
-              const actions = card.querySelector('.actions') || (card.querySelector('.ctrl-btn') && card.querySelector('.ctrl-btn').parentElement);
-              if (actions) actions.appendChild(shapeBtn);
-            }
-          } else if (firstState && firstState.parentElement && shapeBtn.parentElement !== firstState.parentElement){
-            firstState.parentElement.insertBefore(shapeBtn, firstState);
-          }
-          const shaped = (it.shape && it.shape.active);
-          shapeBtn.classList.remove('b-shape','b-clear','b-unk');
-          shapeBtn.classList.add(shaped ? 'b-clear' : 'b-shape');
-          shapeBtn.querySelector('.shape-label').textContent = shaped ? 'حذف محدودیت' : 'محدودیت';
-          shapeBtn.onclick = async ()=>{
-            try{
-              const headers = Object.assign({"Content-Type":"application/json"}, CONTROL_TOKEN?{"X-Auth-Token": CONTROL_TOKEN}:{});
-              if (!shaped){
-                const v = prompt('سقف سرعت آپلود (Mbps) را وارد کنید:');
-                if (!v) return;
-                const rate = parseFloat(String(v).replace(',','.'));
-                if (!(rate>0)){ alert('مقدار نامعتبر'); return; }
-                const res = await fetch(`/api/shape/${encodeURIComponent(it.name)}/limit`, {method:'POST', headers, body: JSON.stringify({rate_mbit: rate})});
-                if(!res.ok){ alert('خطا در اعمال محدودیت'); }
-              }else{
-                const res = await fetch(`/api/shape/${encodeURIComponent(it.name)}/clear`, {method:'POST', headers});
-                if(!res.ok){ alert('خطا در حذف محدودیت'); }
-              }
-            } finally { await loadInterfaces(); }
-          };
-        }catch(e){ console.error('shape-btn error', e); }
-                try{
-              const headers = Object.assign({"Content-Type":"application/json"}, CONTROL_TOKEN?{"X-Auth-Token": CONTROL_TOKEN}:{});
-              if (!shaped){
-                const v = prompt('سقف سرعت آپلود (Mbps) را وارد کنید:');
-                if (!v) return;
-                const rate = parseFloat(String(v).replace(',','.'));
-                if (!(rate>0)){ alert('مقدار نامعتبر'); return; }
-                const res = await fetch(`/api/shape/${encodeURIComponent(it.name)}/limit`, {method:'POST', headers, body: JSON.stringify({rate_mbit: rate})});
-                if(!res.ok){ alert('خطا در اعمال محدودیت'); }
-              }else{
-                const res = await fetch(`/api/shape/${encodeURIComponent(it.name)}/clear`, {method:'POST', headers});
-                if(!res.ok){ alert('خطا در حذف محدودیت'); }
-              }
-            } finally { await loadInterfaces(); }
-          };
-        } else {
-          sbtn.classList.add('hidden');
-        }
-
         btn.onclick = async ()=>{
           const act = isUp ? 'down' : 'up';
           await controlIface(btn, it.name, act);
           await loadInterfaces();
         };
 
+        // دکمهٔ محدودیت (shape)
+        const sbtn   = card.querySelector('.shape-btn');
+        const shaped = !!(it.shape && (it.shape.active || (it.shape.detail && (it.shape.detail.up?.active || it.shape.detail.down?.active))));
+        if (it.can_control){
+          sbtn.classList.remove('hidden','b-warn','b-unk','b-clear','b-shape');
+          sbtn.classList.add(shaped ? 'b-clear' : 'b-shape');
+          sbtn.querySelector('.shape-label').textContent = shaped ? 'حذف محدودیت' : 'محدودیت';
+          sbtn.onclick = () => openShapeModal(it.name, it.shape?.detail);
+        } else {
+          sbtn.classList.add('hidden');
+        }
+
         wrap.appendChild(card);
-        // restore last period line if we have it
+
+        // آمار دوره‌ای
         if (LAST_PERIOD[it.name]){
           const title = (PERIOD_SCOPE==='daily'?'امروز':'ماه جاری');
           const rx = fmtBytes(LAST_PERIOD[it.name].rx||0);
           const tx = fmtBytes(LAST_PERIOD[it.name].tx||0);
           card.querySelector('.period').textContent = `${title}: DL ${rx} | UL ${tx}`;
         }
+
+        // چارت
         let chart;
         try { chart = makeChart(card.querySelector('.chart')); }
         catch(e){ chart = { data:{labels:[],datasets:[{data:[]},{data:[]}]}, update: ()=>{} }; }
         cards.set(it.name, { el: card, chart });
       }
-    
-  try{ NetdashPlaceButtons(); }catch(e){}
-}
+
+      // بعد از رندر کارت‌ها، جای‌گذاری دکمه‌ها
+      NetdashPlaceButtons();
+    }
 
     async function loadHistory(){
       try{
@@ -1874,25 +2162,6 @@ function applyPeriodToCards(){
       }catch(e){}
     }
 
-    function updateStatsForCard(cardObj){
-      const ch = cardObj.chart;
-      const W = Math.max(1, Math.min(STAT_WINDOW, MAX_POINTS));
-      const rx = ch.data.datasets[0].data.slice(-W).map(v=>Number(v));
-      const tx = ch.data.datasets[1].data.slice(-W).map(v=>Number(v));
-      const mean = arr => (arr.length? (arr.reduce((a,b)=>a+b,0)/arr.length):0);
-      const percentile = (arr,p)=>{
-        if(arr.length===0) return 0;
-        const s = arr.slice().sort((a,b)=>a-b);
-        const idx = Math.min(s.length-1, Math.max(0, Math.floor(p*(s.length-1))));
-        return s[idx];
-      };
-      const dl = {mu: mean(rx), mx: (rx.length? Math.max(...rx):0), p95: percentile(rx,0.95)};
-      const ul = {mu: mean(tx), mx: (tx.length? Math.max(...tx):0), p95: percentile(tx,0.95)};
-      const line = `DL μ/max/۹۵٪: ${dl.mu.toFixed(1)}/${dl.mx.toFixed(1)}/${dl.p95.toFixed(1)} | UL μ/max/۹۵٪: ${ul.mu.toFixed(1)}/${ul.mx.toFixed(1)}/${ul.p95.toFixed(1)} [${W}s]`;
-      cardObj.el.querySelector('.stats').textContent = line;
-    }
-
-
     async function updatePing(){
       try{
         const res = await fetch('/api/ping',{cache:'no-store'});
@@ -1905,7 +2174,6 @@ function applyPeriodToCards(){
           const chip = document.createElement('div');
           chip.className = 'badge b-up';
           chip.innerHTML = `<span class="k">${host}</span> <span class="ltr">${m.avg.toFixed(1)} ms</span> <span class="ltr">(${m.loss.toFixed(1)}% loss)</span>`;
-          // color if high loss
           if (m.loss > 5.0){ chip.className = 'badge b-down'; }
           else if (m.avg > 80){ chip.className = 'badge b-unk'; }
           wrap.appendChild(chip);
@@ -1958,159 +2226,127 @@ function applyPeriodToCards(){
         PERIOD_SCOPE = scope;
         LAST_PERIOD = rep.ifaces || {};
         applyPeriodToCards();
-        // small visual feedback on the Report button
         const btn = document.getElementById('reportBtn');
-        const old = btn.textContent;
-        btn.textContent = 'به‌روز شد';
+        const old = btn.textContent; btn.textContent = 'به‌روز شد';
         setTimeout(()=>btn.textContent = old, 800);
       } catch(e){}
     }
 
-    // Filter
-    const filterInput = document.getElementById('filterInput');
-    filterInput.addEventListener('input', e=>{
-      const q = e.target.value.trim().toLowerCase();
-      for(const {el} of cards.values()){
-        const name = (el.dataset.iface||"").toLowerCase();
-        el.style.display = name.includes(q) ? '' : 'none';
-      }
-    });
-
-    // Theme
-    const darkBtn = document.getElementById('darkBtn');
-    function applyTheme(){
-      const on = localStorage.getItem('netdash-dark') === '1';
-      document.documentElement.classList.toggle('dark', on);
+    // Filter فرم‌ها
+    async function populateFilterIfaces(){
+      try{
+        const res = await fetch('/api/interfaces',{cache:'no-store'});
+        const ifs = await res.json();
+        const sel = document.getElementById('flt-iface');
+        if(!sel) return;
+        const cur = sel.value;
+        sel.innerHTML = `<option value="">همه</option>` + ifs.map(x=>`<option value="${x.name}">${x.name}</option>`).join('');
+        if (Array.from(sel.options).some(o=>o.value===cur)) sel.value = cur;
+      }catch(e){}
     }
-    darkBtn.addEventListener('click', ()=>{
-      const cur = localStorage.getItem('netdash-dark') === '1';
-      localStorage.setItem('netdash-dark', cur ? '0' : '1');
+    async function refreshFilters(){
+      try{
+        const headers = CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {};
+        const res = await fetch('/api/filters', {headers, cache:'no-store'});
+        if(!res.ok){ return; }
+        const data = await res.json();
+        const tbody = document.getElementById('flt-tbody');
+        if(!tbody) return;
+        tbody.innerHTML = '';
+        for(const it of (data.items||[])){
+          const pp = (it.proto||'all') + (it.port? (':'+it.port):'');
+          const resolved = []
+            .concat((it.realized&&it.realized.v4)||[])
+            .concat((it.realized&&it.realized.v6)||[]);
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td class="py-1 pr-4 k">${it.pattern}</td>
+            <td class="py-1 pr-4 k">${it.iface || '—'}</td>
+            <td class="py-1 pr-4 k">${pp}</td>
+            <td class="py-1 pr-4 k">${resolved.length? resolved.join(', '): '—'}</td>
+            <td class="py-1 pr-4"><button class="badge badge-btn b-down" data-id="${it.id}">حذف</button></td>`;
+          tr.querySelector('button').onclick = async (ev)=>{
+            if(!confirm('این مورد از بلاک‌لیست حذف شود؟')) return;
+            const id = ev.currentTarget.getAttribute('data-id');
+            try{
+              const res = await fetch('/api/filters/'+encodeURIComponent(id), { method:'DELETE', headers: CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {} });
+              if(!res.ok){ alert('حذف نشد'); return; }
+              refreshFilters();
+            }catch(e){ alert('خطا در حذف: '+e); }
+          };
+          tbody.appendChild(tr);
+        }
+      }catch(e){}
+    }
+    async function addFilterFromForm(){
+      const pattern = document.getElementById('flt-pattern').value.trim();
+      const show_page = document.getElementById('flt-page').checked;
+      const iface   = document.getElementById('flt-iface').value.trim();
+      const proto   = document.getElementById('flt-proto').value.trim() || 'all';
+      const portVal = document.getElementById('flt-port').value.trim();
+      const port    = portVal ? parseInt(portVal,10) : null;
+      if(!pattern){ alert('دامنه یا IP/CIDR را وارد کنید'); return; }
+      const btn = document.getElementById('flt-add');
+      const old = btn.textContent; btn.textContent='در حال افزودن...'; btn.setAttribute('disabled','disabled');
+      try{
+        const headers = {"Content-Type":"application/json"};
+        if (CONTROL_TOKEN) headers["X-Auth-Token"] = CONTROL_TOKEN;
+        const res = await fetch('/api/filters', { method:'POST', headers, body: JSON.stringify({pattern, iface: iface||null, proto, port, show_page}) });
+        if(!res.ok){
+          const t = await res.text();
+          alert('عدم موفقیت: '+ t);
+        } else {
+          document.getElementById('flt-pattern').value=''; document.getElementById('flt-port').value='';
+          refreshFilters();
+        }
+      }catch(e){ alert('خطا: '+e); }
+      finally{ btn.textContent=old; btn.removeAttribute('disabled'); }
+    }
+
+    // ---------- Init & events ----------
+    window.addEventListener('load', ()=>{
+      // UI init
+      initStatWindowSelector();
+      bindShapeModalHandlers();
+
+      // Filter events
+      try{
+        populateFilterIfaces();
+        refreshFilters();
+        const btn = document.getElementById('flt-add');
+        if(btn) btn.addEventListener('click', addFilterFromForm);
+        setInterval(populateFilterIfaces, 30000);
+        setInterval(refreshFilters, 15000);
+      }catch(e){}
+
+      // Theme toggle
+      const darkBtn = document.getElementById('darkBtn');
+      function applyTheme(){ const on = localStorage.getItem('netdash-dark') === '1'; document.documentElement.classList.toggle('dark', on); }
+      darkBtn.addEventListener('click', ()=>{ const cur = localStorage.getItem('netdash-dark') === '1'; localStorage.setItem('netdash-dark', cur ? '0' : '1'); applyTheme(); });
       applyTheme();
+
+      // Live data
+      (async function init(){
+        await loadInterfaces();
+        await loadHistory();
+        tick();
+        setInterval(tick, 1000);
+        setInterval(loadInterfaces, 30000);
+        setInterval(updatePing, 5000);
+        updatePing();
+        const scopeSel = document.getElementById('scopeSel');
+        const reportBtn = document.getElementById('reportBtn');
+        reportBtn.addEventListener('click', ()=> loadPeriod(scopeSel.value));
+        scopeSel.addEventListener('change', ()=> loadPeriod(scopeSel.value));
+        loadPeriod(scopeSel.value);
+      })();
     });
-    applyTheme();
 
-    // Report
-    const scopeSel = document.getElementById('scopeSel');
-    const reportBtn = document.getElementById('reportBtn');
-    reportBtn.addEventListener('click', ()=> loadPeriod(scopeSel.value));
-scopeSel.addEventListener('change', ()=> loadPeriod(scopeSel.value));
-setInterval(()=> loadPeriod(scopeSel.value), 15000);
-
-    (async function init(){
-      await loadInterfaces();
-      await loadHistory();
-      tick();
-      setInterval(tick, 1000);
-      setInterval(loadInterfaces, 30000);
-      setInterval(updatePing, 5000);
-      updatePing();
-      loadPeriod(scopeSel.value);
-    })();
-  
-// === Keep pause/resume button next to status badges ===
-(function(){
-  function placeCtrlNextToState(card){
-    try{
-      const ctrl = card.querySelector('.ctrl-btn');
-      if(!ctrl) return;
-      // likely row for badges:
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-        if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-          try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-        }
-        badgeRow.insertBefore(ctrl, last.nextSibling);
-        ctrl.classList.add('badge-btn','shrink-0');
-      }
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeCtrlNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
-
-
-// === Keep shape (محدودیت) button next to status badges and color it red ===
-(function(){
-  function placeShapeNextToState(card){
-    try{
-      const shape = card.querySelector('.shape-btn');
-      if(!shape) return;
-      const badgeRow = card.querySelector('.badge.state')?.parentElement;
-      if(!badgeRow) return;
-      const states = card.querySelectorAll('.badge.state');
-      if(!states.length) return;
-      const last = states[states.length-1];
-      // place right after last state
-      if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-        if (shape.parentElement && shape.parentElement !== badgeRow){
-          try{ shape.parentElement.removeChild(shape); }catch{}
-        }
-        badgeRow.insertBefore(shape, last.nextSibling);
-        shape.classList.add('badge-btn','shrink-0');
-      }
-      // enforce red/white style regardless of class toggling
-      shape.classList.add('b-shape'); // ensure one of the classes is present
-      shape.classList.remove('b-warn'); // remove old yellow if present
-    }catch(e){}
-  }
-  function placeAll(){ document.querySelectorAll('.card').forEach(placeShapeNextToState); }
-  window.addEventListener('load', placeAll);
-  })();
-
-
-// === NetDash helper: place control & shape buttons next to status badges (one-shot; called on load & after render) ===
-function NetdashPlaceButtons(){
-  try{
-    document.querySelectorAll('.card').forEach(card => {
-      // ctrl-btn
-      try{
-        const ctrl = card.querySelector('.ctrl-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (ctrl && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (ctrl.parentElement !== badgeRow || ctrl.previousElementSibling !== last){
-            if (ctrl.parentElement && ctrl.parentElement !== badgeRow){
-              try{ ctrl.parentElement.removeChild(ctrl); }catch{}
-            }
-            badgeRow.insertBefore(ctrl, last.nextSibling);
-            ctrl.classList.add('badge-btn','shrink-0');
-          }
-        }
-      }catch(e){ console.error('ctrl-btn move error', e); }
-      // shape-btn
-      try{
-        const shape = card.querySelector('.shape-btn');
-        const badgeRow = card.querySelector('.badge.state')?.parentElement;
-        const states = card.querySelectorAll('.badge.state');
-        if (shape && badgeRow && states.length){
-          const last = states[states.length-1];
-          if (shape.parentElement !== badgeRow || shape.previousElementSibling !== last){
-            if (shape.parentElement && shape.parentElement !== badgeRow){
-              try{ shape.parentElement.removeChild(shape); }catch{}
-            }
-            badgeRow.insertBefore(shape, last.nextSibling);
-            shape.classList.add('badge-btn','shrink-0');
-          }
-          // force red/white style
-          shape.classList.add('b-shape');
-          shape.classList.remove('b-warn');
-        }
-      }catch(e){ console.error('shape-btn move error', e); }
-    });
-  }catch(e){}
-}
-window.addEventListener('load', NetdashPlaceButtons);
-window.addEventListener('load', initStatWindowSelector);
-
-</script>
+  </script>
 </body>
 </html>
 """
+
 
 # ------------------ Routes ------------------
 @app.route("/")
@@ -2119,6 +2355,12 @@ def home():
     resp = make_response(html)
     resp.headers["Cache-Control"] = "no-store"
     return resp
+    
+@app.route("/api/filters/flush-sets", methods=["POST"])
+def api_filters_flush_sets():
+    _require_token()
+    _flush_all_ipsets()
+    return jsonify({"ok": True})
 
 @app.route("/api/interfaces")
 def api_interfaces():
@@ -2160,16 +2402,21 @@ def api_shape_limit(iface):
         abort(403, description="Interface not permitted")
     _require_token()
     body = request.get_json(silent=True) or {}
+    direction = (body.get("direction") or "up").strip().lower()  # up | down
     rate = float(body.get("rate_mbit", 0))
     if rate <= 0:
         abort(400, "rate_mbit must be > 0")
     burst = int(body.get("burst_kbit", 32))
     latency = int(body.get("latency_ms", 400))
     try:
-        tc_limit(iface, rate, burst, latency)
-        return jsonify({"ok": True, "iface": iface, "rate_mbit": rate})
+        if direction == "down":
+            tc_limit_down(iface, rate, burst, latency)
+        else:
+            tc_limit(iface, rate, burst, latency)
+        return jsonify({"ok": True, "iface": iface, "direction": direction, "rate_mbit": rate})
     except subprocess.CalledProcessError as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/api/filters", methods=["GET"])
 def api_filters_list():
@@ -2213,8 +2460,17 @@ def api_shape_clear(iface):
     if not can_control(iface):
         abort(403, description="Interface not permitted")
     _require_token()
-    tc_clear(iface)
-    return jsonify({"ok": True, "iface": iface})
+    body = request.get_json(silent=True) or {}
+    direction = (body.get("direction") or "up").strip().lower()  # up | down | both
+    if direction in ("both", "all"):
+        tc_clear(iface)
+        tc_clear_down(iface)
+    elif direction == "down":
+        tc_clear_down(iface)
+    else:
+        tc_clear(iface)
+    return jsonify({"ok": True, "iface": iface, "direction": direction})
+
 
 
 def _flush_on_exit():
