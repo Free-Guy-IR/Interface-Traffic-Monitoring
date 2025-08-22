@@ -31,7 +31,8 @@ SNI_LEARN_ENABLED = os.environ.get("NETDASH_SNI_LEARN","1").lower() in ("1","tru
 
 # اتوماسیون‌های بوت‌استرپ (برای اینکه هیچ دستور دستی لازم نشود)
 AUTO_ENFORCE_DNS = os.environ.get("NETDASH_ENFORCE_DNS","1").lower() in ("1","true","yes","on")
-AUTO_BLOCK_DOT   = os.environ.get("NETDASH_BLOCK_DOT","1").lower() in ("1","true","yes","on")
+AUTO_BLOCK_DOT = os.environ.get("NETDASH_BLOCK_DOT","0").lower() in ("1","true","yes","on")
+
 
 AUTO_PRELOAD_META = os.environ.get("NETDASH_PRELOAD_META","0").lower() in ("1","true","yes","on")
 
@@ -79,7 +80,6 @@ _try_modprobe("xt_string")
 BLOCK_PAGE_HTML = r"""
 <!doctype html>
 <html lang="fa" dir="rtl">
-<head>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -642,17 +642,8 @@ monitor = NetMonitor(POLL_INTERVAL)
 monitor.start()
 start_block_server()
 
-try:
-    if USE_DNSMASQ_IPSET:
-        ensure_ipset_and_rules()      # ست‌ها و قوانین پایه
-    if AUTO_ENFORCE_DNS:
-        _ensure_dns_redirection()     # اجبار DNS به dnsmasq محلی
-    if AUTO_BLOCK_DOT:
-        _ensure_block_dot()           # بستن DoT
-    if AUTO_PRELOAD_META:
-        _preload_blocklist()          # افزودن دامنه‌های پیش‌فرض
-except Exception as e:
-    print("[netdash] bootstrap warning:", e)
+
+
 # ------------------ Controls ------------------
 def _find_ip_binary():
     for p in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "ip"):
@@ -838,13 +829,23 @@ def _lan_ifaces_guess():
 
 # --- ENFORCE DNS: همهٔ درخواست‌های 53 به dnsmasq لوکال برود ---
 def _ensure_dns_redirection():
-    # برای پروسه‌های همین ماشین
-    for proto in ("udp","tcp"):
-        _ipt_ensure(["OUTPUT","-p",proto,"--dport","53","-j","REDIRECT","--to-ports","53"], table="nat")
-    # برای کلاینت‌های LAN
+    # فقط ترافیک کلاینت‌های LAN را بگیر (PREROUTING)، نه خروجی خود میزبان
     for lan in _lan_ifaces_guess():
-        for proto in ("udp","tcp"):
-            _ipt_ensure(["PREROUTING","-i",lan,"-p",proto,"--dport","53","-j","REDIRECT","--to-ports","53"], table="nat")
+        for proto in ("udp", "tcp"):
+            # IPv4
+            _ipt_ensure(
+                ["PREROUTING", "-i", lan, "-p", proto, "--dport", "53",
+                 "-j", "REDIRECT", "--to-ports", "53"],
+                table="nat"
+            )
+            # IPv6
+            _ipt_ensure(
+                ["PREROUTING", "-i", lan, "-p", proto, "--dport", "53",
+                 "-j", "REDIRECT", "--to-ports", "53"],
+                table="nat",
+                v6=True
+            )
+
 
 # --- BLOCK DoT (TCP/853) هم برای خروجی خود میزبان هم عبوری روتر ---
 def _ensure_block_dot():
@@ -1180,8 +1181,6 @@ def _normalize_domain(pat: str) -> str:
     return d if d is not None else (pat or "").strip().lower()
 
 def _add_sni_rules_for_domain(domain: str, iface: str | None = None):
-    """اتصالات NEW روی 443/TCP را اگر SNI شامل domain بود DROP می‌کند (همهٔ ساب‌دامنه‌ها).
-       اگر iface داده شود، قانون فقط روی همان خروجی (-o iface) اعمال می‌شود."""
     rules = []
     dom = _normalize_domain(domain)
     if not dom:
@@ -1193,10 +1192,10 @@ def _add_sni_rules_for_domain(domain: str, iface: str | None = None):
             if iface:
                 cmd_insert += ["-o", iface]
             cmd_insert += [
-                "-p", "tcp", "--dport", "443",
-                "-m", "conntrack", "--ctstate", "NEW",
-                "-m", "string", "--string", dom, "--algo", "bm",
-                "-j", "DROP"
+                "-p","tcp","--dport","443",
+                "-m","conntrack","--ctstate","NEW",
+                "-m","string","--string", dom, "--algo","bm","--icase",
+                "-j","DROP"
             ]
             cmd_check = _chk_equivalent(cmd_insert)
             if _run_root(_sudo_wrap(cmd_check)) == 0:
@@ -1204,6 +1203,7 @@ def _add_sni_rules_for_domain(domain: str, iface: str | None = None):
             if _run_root(_sudo_wrap(cmd_insert)) == 0:
                 rules.append({"cmd": cmd_insert, "chain": chain, "ipv6": ipv6})
     return rules
+
 
 
 def _del_rule_obj(r):
@@ -1619,6 +1619,15 @@ class SNILearner:
 
 
 filters = FilterStore(FILTERS_FILE)
+
+
+try:
+    if AUTO_ENFORCE_DNS:  _ensure_dns_redirection()
+    if AUTO_BLOCK_DOT:    _ensure_block_dot()
+    if AUTO_PRELOAD_META: _preload_blocklist()   # این یکی به filters نیاز دارد
+except Exception as e:
+    print("[netdash] bootstrap warning:", e)
+
 
 try:
     sni_learner = SNILearner(ifaces=SNI_LEARN_IFACES or None)
