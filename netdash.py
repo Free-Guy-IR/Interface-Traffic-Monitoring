@@ -11,6 +11,47 @@ from collections import deque, defaultdict
 from flask import Flask, jsonify, render_template_string, make_response, request, abort
 import socket, ipaddress, uuid, random, string
 
+
+
+# --- registrable domain helper (base domain) ---
+try:
+    from publicsuffix2 import get_sld as _psl_get_sld
+    def _registrable_domain(host: str) -> str | None:
+        h = (host or "").strip().lower().strip(".")
+        if not h or "." not in h: return None
+        try:
+            return _psl_get_sld(h)
+        except Exception:
+            return None
+except Exception:
+    try:
+        import tldextract
+        _tldx = tldextract.TLDExtract(suffix_list_urls=None)  # از snapshot داخلی استفاده می‌کند
+        def _registrable_domain(host: str) -> str | None:
+            h = (host or "").strip().lower().strip(".")
+            if not h or "." not in h: return None
+            ext = _tldx(h)
+            if not ext.domain or not ext.suffix: return None
+            return f"{ext.domain}.{ext.suffix}"
+    except Exception:
+        # fallback خیلی ساده (برخی 2nd-levelهای رایج)
+        _2nd = {"co.uk","org.uk","ac.uk","gov.uk","co.ir","ac.ir","gov.ir","com.au","net.au","org.au"}
+        def _registrable_domain(host: str) -> str | None:
+            h = (host or "").strip().lower().strip(".")
+            if not h or "." not in h: return None
+            parts = h.split(".")
+            if len(parts) < 2: return None
+            suf2 = ".".join(parts[-2:])
+            suf3 = ".".join(parts[-3:])
+            if suf2 in _2nd and len(parts) >= 3:  # خیلی ساده
+                return ".".join(parts[-3:])
+            if suf3 in _2nd and len(parts) >= 4:
+                return ".".join(parts[-4:])
+            return suf2
+
+
+
+
 # ---------------------- Config ----------------------
 
 POLL_INTERVAL = 1.0   # seconds
@@ -39,7 +80,6 @@ AUTO_PRELOAD_META = os.environ.get("NETDASH_PRELOAD_META","0").lower() in ("1","
 AUTO_PIP_INSTALL = os.environ.get("NETDASH_AUTO_PIP","1").lower() in ("1","true","yes","on")
 # --- toggle for block page mode (redirect http to 451) ---
 SNI_LEARN_IFACES  = [x.strip() for x in os.environ.get("NETDASH_SNI_IFACES","").split(",") if x.strip()]
-
 
 
 
@@ -155,14 +195,21 @@ def blocked_any(path):
     return render_template_string(BLOCK_PAGE_HTML, host=host), 451
 
 def start_block_server():
-    def run(host):
-        blockapp.run(host=host, port=BLOCK_PORT, debug=False, use_reloader=False)
-    threading.Thread(target=run, args=("0.0.0.0",), daemon=True).start()
-    try:
-        if socket.has_ipv6:
-            threading.Thread(target=run, args=("::",), daemon=True).start()
-    except Exception:
-        pass
+    if getattr(start_block_server, "_started", False):
+        return
+    start_block_server._started = True
+
+    def run_once(host):
+        try:
+            blockapp.run(host=host, port=BLOCK_PORT, debug=False, use_reloader=False)
+        except OSError as e:
+            print(f"[netdash] block server bind failed on {host}:{BLOCK_PORT}: {e}")
+
+    host = "::" if socket.has_ipv6 else "0.0.0.0"
+    # تلاش برای IPv6 (دو-استک). اگر ارور داد، روی IPv4 امتحان کن.
+    t = threading.Thread(target=run_once, args=(host,), daemon=True)
+    t.start()
+
 
 
 
@@ -186,25 +233,36 @@ def _pick_data_home():
             continue
     return os.getcwd()
 
+# ⬅️ این سه خط باید بلافاصله بعد از تابع بالا بیاید
 DATA_HOME = _pick_data_home()
-
-# === SNI logging ===
 SNI_LOG_FILE = os.path.join(DATA_HOME, "sni-seen.log")
+SNI_INDEX_FILE = os.path.join(DATA_HOME, "sni-index.json")
+SNI_INDEX_PRESEED_ON_ADD = True
 _SNI_LOG_LOCK = threading.Lock()
+
+FILTERS_FILE = os.path.join(DATA_HOME, "filters.json")
+HISTORY_FILE = os.path.join(DATA_HOME, "history.json")
+TOTALS_FILE  = os.path.join(DATA_HOME, "totals.json")
+PERIOD_FILE  = os.path.join(DATA_HOME, "period_totals.json")
+
+
 
 def _append_sni_log(kind, host, dst_ip, fam=None, base=None, iface=None):
     rec = {
         "ts": int(time.time()),
-        "kind": kind,       # مثلاً 'sni'
-        "host": host,       # نامِ کامل ساب‌دامنه از SNI
-        "dst_ip": dst_ip,   # آی‌پی مقصد همان اتصال
-        "fam": fam,         # 'v4' یا 'v6'
-        "base": base,       # دامنه‌ای که در فهرست مسدودی دادی (اگر match شود)
-        "iface": iface,     # اینترفیس (اگر scapy بدهد)
+        "kind": kind,
+        "host": host,
+        "dst_ip": dst_ip,
+        "fam": fam,
+        "base": base,
+        "iface": iface,   # می‌تواند NetworkInterface باشد
     }
     try:
         os.makedirs(os.path.dirname(SNI_LOG_FILE), exist_ok=True)
-        line = json.dumps(rec, ensure_ascii=False)
+        # ⬅️ نکته‌ی مهم: default=str
+        line = json.dumps(rec, ensure_ascii=False, default=str)
+
+
         with _SNI_LOG_LOCK:
             with open(SNI_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -213,10 +271,7 @@ def _append_sni_log(kind, host, dst_ip, fam=None, base=None, iface=None):
 
 
 
-FILTERS_FILE = os.path.join(DATA_HOME, "filters.json")
-HISTORY_FILE = os.path.join(DATA_HOME, "history.json")
-TOTALS_FILE  = os.path.join(DATA_HOME, "totals.json")
-PERIOD_FILE  = os.path.join(DATA_HOME, "period_totals.json")
+
 
 # ------------------ Helpers ------------------
 def _run_ip_json(args):
@@ -356,6 +411,108 @@ def read_counters(iface):
     return read_one("rx_bytes"), read_one("tx_bytes")
 
 # ------------------ Stores ------------------
+
+class SNIIndex:
+    """
+    ساختار فایل:
+    {
+      "v": 1,
+      "domains": {
+        "<base>": {
+          "first_seen": int,
+          "last_seen": int,
+          "ips": {"v4": {"1.2.3.4": ts, ...}, "v6": {"2001:db8::1": ts, ...}},
+          "subs": {
+            "<fqdn>": {
+              "last_seen": int,
+              "ips": {"v4": {...}, "v6": {...}}
+            }
+          }
+        }
+      }
+    }
+    """
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.idx = {"v":1, "domains": {}}
+        self.lock = threading.Lock()
+        self._last_flush = 0.0
+        self.flush_interval = 5.0
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict) and "domains" in obj:
+                self.idx = obj
+        except Exception:
+            self.idx = {"v":1, "domains": {}}
+
+    def flush(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_flush) < self.flush_interval:
+            return
+        with self.lock:
+            data = json.loads(json.dumps(self.idx))  # اطمینان از serializable بودن
+        tmp = self.filepath + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self.filepath)
+            self._last_flush = now
+        except Exception:
+            pass
+
+    def _upd_ipmap(self, ipmap: dict, ip: str, ts: int):
+        try:
+            ipmap[ip] = int(ts)
+        except Exception:
+            pass
+
+    def update(self, host: str, dst_ip: str, fam: str, iface: str | None = None, ts: int | None = None):
+        if not host or not dst_ip or fam not in ("v4","v6"):
+            return
+        base = _registrable_domain(host) or _normalize_domain_or_none(host) or host.strip().lower().strip(".")
+        if not base:
+            return
+        t = int(ts or time.time())
+        with self.lock:
+            dom = self.idx["domains"].setdefault(base, {
+                "first_seen": t, "last_seen": t,
+                "ips": {"v4": {}, "v6": {}},
+                "subs": {}
+            })
+            dom["last_seen"] = t
+            self._upd_ipmap(dom["ips"][fam], dst_ip, t)
+            if host != base:
+                sub = dom["subs"].setdefault(host, {"last_seen": t, "ips": {"v4": {}, "v6": {}}})
+                sub["last_seen"] = t
+                self._upd_ipmap(sub["ips"][fam], dst_ip, t)
+        self.flush()
+
+    def get_ips_for_base(self, base: str):
+        base = (base or "").strip().lower().strip(".")
+        if not base: return [], []
+        v4, v6 = set(), set()
+        now = int(time.time())
+        with self.lock:
+            dom = self.idx["domains"].get(base)
+            if not dom: return [], []
+            for ip, ts in (dom.get("ips", {}).get("v4", {}) or {}).items():
+                v4.add(ip)
+            for ip, ts in (dom.get("ips", {}).get("v6", {}) or {}).items():
+                v6.add(ip)
+            for sub in (dom.get("subs") or {}).values():
+                for ip, ts in (sub.get("ips", {}).get("v4", {}) or {}).items():
+                    v4.add(ip)
+                for ip, ts in (sub.get("ips", {}).get("v6", {}) or {}).items():
+                    v6.add(ip)
+        return sorted(v4), sorted(v6)
+
+sni_index = SNIIndex(SNI_INDEX_FILE)
+
+
 class HistoryStore:
     def __init__(self, filepath, max_points=120):
         self.filepath = filepath
@@ -639,8 +796,8 @@ class NetMonitor:
             return {"ts": time.time(), "rates": dict(self.data)}
 
 monitor = NetMonitor(POLL_INTERVAL)
-monitor.start()
-start_block_server()
+
+
 
 
 
@@ -877,7 +1034,7 @@ def _preload_blocklist():
 
 
 
-# 👇👇 اینجا بچسبان
+# ������������ اینجا بچسبان
 def _prime_dnsmasq_for_items(items_dict):
     domains = set()
     for it in items_dict.values():
@@ -944,6 +1101,25 @@ def _rebuild_dnsmasq_conf_from_items(items_dict):
     _dnsmasq_hup()
     _prime_dnsmasq_for_items(items_dict)  # همین بس است؛ خطِ اضافه حذف شد
 
+    
+    
+    
+    
+# --- PRESEED از ایندکس SNI برای ipset (برای کاهش تاخیر) ---
+def _preseed_ipset_from_index(domain: str, show_page: bool):
+    base = _registrable_domain(domain) or _normalize_domain_or_none(domain) or domain.strip().lower().strip(".")
+    if not base:
+        return
+    v4, v6 = sni_index.get_ips_for_base(base)
+    set4 = IPSET4P if (show_page and PAGE_MODE_ENABLED) else IPSET4
+    set6 = IPSET6P if (show_page and PAGE_MODE_ENABLED) else IPSET6
+    for ip in v4:
+        _run_root(["ipset","add", set4, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+        print(f"[netdash] preseed: {ip} -> {set4} (base={base})")
+    for ip in v6:
+        _run_root(["ipset","add", set6, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+        print(f"[netdash] preseed: {ip} -> {set6} (base={base})")
+        
     
 def _hostname_matches(host: str, base: str) -> bool:
     """host endswith .base یا مساوی با base (هر دو نرمالایز)."""
@@ -1019,6 +1195,44 @@ def _flush_all_ipsets():
             _run_root(["ipset", "flush", name])
         except Exception:
             pass
+
+def _del_domain_everywhere(rec):
+    """
+    همهٔ IPهایی که به هر طریقی به این دامنه وصل بوده‌اند را از هر چهار ipset حذف می‌کند.
+    rec همان آیتمِ فیلتر قبل از حذف است.
+    """
+    try:
+        pat = (rec or {}).get("pattern","").strip()
+        if not pat:
+            return
+        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
+        if not base:
+            return
+
+        # 1) از sni-index (تمام IPهای v4/v6 برای base و زیر دامنه‌ها)
+        v4_idx, v6_idx = sni_index.get_ips_for_base(base)
+
+        # 2) از realized همین رکورد (چیزی که SNI-learner یا preseed قبلاً وارد کرده)
+        v4_real = set(((rec.get("realized") or {}).get("v4") or []))
+        v6_real = set(((rec.get("realized") or {}).get("v6") or []))
+
+        # 3) از DNS لحظه‌ای (ممکن است IP جدید باشد)
+        v4_now, v6_now = _resolve_domain(base)
+
+        v4_all = sorted(set(v4_idx) | v4_real | set(v4_now))
+        v6_all = sorted(set(v6_idx) | v6_real | set(v6_now))
+
+        # 4) از هر چهار ست حذف کن (ممکن است قبلاً Page-mode بوده باشد)
+        for ip in v4_all:
+            _run_root(["ipset","del", IPSET4,  ip])
+            _run_root(["ipset","del", IPSET4P, ip])
+        for ip in v6_all:
+            _run_root(["ipset","del", IPSET6,  ip])
+            _run_root(["ipset","del", IPSET6P, ip])
+    except Exception as e:
+        print("[netdash] purge domain failed:", e)
+
+
 
 def _del_domain_from_ipsets(domain: str, show_page: bool):
     """
@@ -1214,6 +1428,100 @@ def _del_rule_obj(r):
     dcmd = _del_equivalent(cmd)
     _run_root(_sudo_wrap(dcmd))
 
+# === Safe cleanup helpers (domain-aware) ===
+
+def _domain_base(s: str) -> str | None:
+    s = (s or "").strip()
+    base = _registrable_domain(s) or _normalize_domain_or_none(s) or s.strip().lower().strip(".")
+    return base if base and "." in base else None
+
+def _iter_other_blocked_domains(except_id=None, except_base=None):
+    """تمام دامنه‌های فعلاً-بلاک (به‌جز موردی که داریم حذف می‌کنیم) را بده."""
+    try:
+        with filters.lock:
+            for rec in (filters.items or {}).values():
+                if not isinstance(rec, dict):
+                    continue
+                if except_id and rec.get("id") == except_id:
+                    continue
+                pat = (rec.get("pattern") or "").strip()
+                if not pat or _split_family(pat) is not None:
+                    continue  # فقط دامنه
+                base = _domain_base(pat)
+                if not base:
+                    continue
+                if except_base and base == except_base:
+                    continue
+                yield base, rec
+    except Exception:
+        return
+
+def _collect_ips_for_base(base: str, rec: dict | None = None):
+    """IPهای مرتبط با یک base را از SNI-index + DNS + realized جمع می‌کند."""
+    v4s, v6s = set(), set()
+    # از ایندکس SNI
+    try:
+        v4i, v6i = sni_index.get_ips_for_base(base)
+        v4s.update(v4i or [])
+        v6s.update(v6i or [])
+    except Exception:
+        pass
+    # DNS لحظه‌ای
+    try:
+        v4d, v6d = _resolve_domain(base)
+        v4s.update(v4d or [])
+        v6s.update(v6d or [])
+    except Exception:
+        pass
+    # realized رکوردِ خودِ دامنه (اگر دادیم)
+    if rec:
+        try:
+            v4s.update((rec.get("realized", {}) or {}).get("v4", []) or [])
+            v6s.update((rec.get("realized", {}) or {}).get("v6", []) or [])
+        except Exception:
+            pass
+    return sorted(v4s), sorted(v6s)
+
+def _ip_needed_by_other_blocks(ip: str, fam: str, *, except_id=None, except_base=None) -> bool:
+    """اگر IP توسط دامنه‌های بلاکِ دیگر لازم است، True می‌دهد."""
+    for obase, orec in _iter_other_blocked_domains(except_id=except_id, except_base=except_base):
+        v4o, v6o = _collect_ips_for_base(obase, orec)
+        if fam == "v4" and ip in v4o:
+            return True
+        if fam == "v6" and ip in v6o:
+            return True
+    return False
+
+def _del_ip_from_all_sets(ip: str, fam: str):
+    """IP را از تمام ست‌های مرتبط پاک کن (DROP و PAGE)."""
+    if fam == "v4":
+        for setname in (IPSET4, IPSET4P):
+            try: _run_root(["ipset", "del", setname, ip])
+            except Exception: pass
+    else:
+        for setname in (IPSET6, IPSET6P):
+            try: _run_root(["ipset", "del", setname, ip])
+            except Exception: pass
+
+def _del_domain_everywhere_safe(rec: dict):
+    """پس از حذف دامنه از لیست، همهٔ IPهای مرتبط با همان دامنه را—در صورت عدم نیازِ دامنه‌های دیگر—از ipsetها پاک می‌کند."""
+    try:
+        pat = (rec.get("pattern") or "").strip()
+        base = _domain_base(pat)
+        if not base:
+            return
+        v4, v6 = _collect_ips_for_base(base, rec)
+
+        for ip in v4:
+            if not _ip_needed_by_other_blocks(ip, "v4", except_id=rec.get("id"), except_base=base):
+                _del_ip_from_all_sets(ip, "v4")
+
+        for ip in v6:
+            if not _ip_needed_by_other_blocks(ip, "v6", except_id=rec.get("id"), except_base=base):
+                _del_ip_from_all_sets(ip, "v6")
+    except Exception as e:
+        print("[netdash] safe-del error:", e)
+
 
 
 class FilterStore:
@@ -1257,6 +1565,16 @@ class FilterStore:
         if USE_DNSMASQ_IPSET:
             ensure_ipset_and_rules()
             _rebuild_dnsmasq_conf_from_items(self.items)
+            
+
+            try:
+                has_domains = any(_split_family((v or {}).get("pattern","")) is None for v in self.items.values())
+                if not has_domains:
+                    _flush_all_ipsets()
+            except Exception:
+                pass
+            
+            
             if SNI_BLOCK_ENABLED:
                 for rec in self.items.values():
                     pat = (rec or {}).get("pattern", "").strip()
@@ -1324,19 +1642,36 @@ class FilterStore:
         if USE_DNSMASQ_IPSET:
             # دامنه → dnsmasq/ipset
             if fam is None:
+                # 1) آیتم را ثبت کن و dnsmasq را از روی لیست کامل بساز
                 with self.lock:
                     self.items[fid] = rec
                     self.flush()
+            
                 _rebuild_dnsmasq_conf_from_items(self.items)
+            
+                # 2) (اختیاری) preseed بر اساس sni-index برای کاهش تاخیر
+                if SNI_INDEX_PRESEED_ON_ADD:
+                    try:
+                        _preseed_ipset_from_index(pat, show_page)
+                        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
+                        v4i, v6i = sni_index.get_ips_for_base(base)
+                        rec["realized"]["v4"] = list(sorted(set(rec["realized"].get("v4", [])) | set(v4i)))
+                        rec["realized"]["v6"] = list(sorted(set(rec["realized"].get("v6", [])) | set(v6i)))
+                        with self.lock:
+                            self.items[fid] = rec
+                            self.flush()
+                    except Exception as e:
+                        print("[netdash] preseed from index failed:", e)
+            
+                # 3) (در صورت فعال بودن) یک بار قوانین SNI را اضافه کن
                 if SNI_BLOCK_ENABLED:
                     rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
-                    
-
-
                     with self.lock:
                         self.items[fid] = rec
                         self.flush()
+            
                 return rec
+
 
             # IP/CIDR → مستقیم به ipset
             if fam == 'v4':
@@ -1434,14 +1769,25 @@ class FilterStore:
                 with self.lock:
                     self.items.pop(fid, None)
                     self.flush()
+        
                 _rebuild_dnsmasq_conf_from_items(self.items)
+        
                 try:
-                    _del_domain_from_ipsets(pat, rec.get("show_page", False))
-                except Exception:
-                    pass
-                if FLUSH_SETS_ON_REMOVE:
+                    _del_domain_everywhere_safe(rec)
+                except Exception as e:
+                    print("[netdash] safe-del warn:", e)
+        
+                any_domains = False
+                with self.lock:
+                    for rr in self.items.values():
+                        if _split_family((rr or {}).get("pattern", "")) is None:
+                            any_domains = True
+                            break
+                if not any_domains:
                     _flush_all_ipsets()
+        
                 return True
+
 
             # --- IP/CIDR ---
             setname = None
@@ -1479,7 +1825,8 @@ class SNILearner:
     def __init__(self, ifaces=None):
         self.ifaces = list(ifaces) if ifaces else None
         self.running = False
-
+        self._recent = {}         # کلید: (fam, dst_ip) → زمان آخرین ثبت
+        self._recent_ttl = 60.0   # ثانیه؛ بازه‌ی ددیوب
     def _match_any_blocked(self, host):
         """اگر host زیرمجموعهٔ یکی از patternهای دامنه در FilterStore باشد، همان رکورد را برگردان."""
         try:
@@ -1496,66 +1843,53 @@ class SNILearner:
 
     def _handle_packet(self, pkt):
         try:
-            # late import تا اگر scapy نیست، اپ بدون learner بالا بیاید
             from scapy.layers.inet import TCP, IP
             from scapy.layers.inet6 import IPv6
+
             if not pkt.haslayer(TCP):
                 return
             tcp = pkt[TCP]
             if tcp.dport != 443:
                 return
+
             payload = bytes(tcp.payload or b"")
             if not payload:
                 return
+
             host = _extract_sni_from_clienthello(payload)
             if not host:
                 return
-                
-            fam = None
-            dst_ip = None
+
+            # v4/v6 و مقصد
             if IP in pkt:
-                fam = "v4"; dst_ip = pkt[IP].dst
+                fam, dst_ip = "v4", pkt[IP].dst
             elif IPv6 in pkt:
-                fam = "v6"; dst_ip = pkt[IPv6].dst
-    
-            # ★ NEW: همیشه لاگ کن (حتی اگر در لیست مسدودی match نشود)
+                fam, dst_ip = "v6", pkt[IPv6].dst
+            else:
+                return
+
             iface_name = getattr(pkt, "sniffed_on", None)
-            _append_sni_log(
-                kind="sni",
-                host=host,
-                dst_ip=dst_ip,
-                fam=fam,
-                base=None,               # فعلاً خالی؛ اگر match شد پایین دوباره با base واقعی لاگ می‌کنیم (اختیاری)
-                iface=iface_name,
-            )
-                
+
+            # لاگ و ایندکس
+            _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam, base=None, iface=iface_name)
+            sni_index.update(host, dst_ip, fam, iface=iface_name)
+
+            # اگر زیرمجموعه یکی از دامنه‌های مسدود نیست، تمام
             rec = self._match_any_blocked(host)
             if not rec:
                 return
-            _append_sni_log(
-                kind="sni",
-                host=host,
-                dst_ip=dst_ip,
-                fam=fam,
-                base=(rec or {}).get("pattern"),
-                iface=iface_name,
-            )
-    
-            if not dst_ip:
-                return
-                
-                
-            # مقصد را در بیاور (v4 یا v6)
-            fam = None
-            dst_ip = None
-            if IP in pkt:
-                fam = "v4"; dst_ip = pkt[IP].dst
-            elif IPv6 in pkt:
-                fam = "v6"; dst_ip = pkt[IPv6].dst
-            if not dst_ip:
-                return
 
-            # انتخاب ست درست با توجه به page-mode و show_page
+            # برای ردیابی، با base هم لاگ کن
+            _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam, base=rec.get("pattern"), iface=iface_name)
+
+            # ددیوب کوتاه‌مدت
+            now = time.time()
+            key = (fam, dst_ip)
+            if now - self._recent.get(key, 0) < self._recent_ttl:
+                return
+            self._recent[key] = now
+
+            # انتخاب ست درست
             use_page = bool(rec.get("show_page") and PAGE_MODE_ENABLED)
             setname = {
                 ("v4", False): IPSET4,
@@ -1564,16 +1898,18 @@ class SNILearner:
                 ("v6", True):  IPSET6P,
             }[(fam, use_page)]
 
-            # اضافه به ipset
-            _run_root(["ipset","add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+            # افزودن به ipset
+            _run_root(["ipset", "add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+            print(f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
 
-            # به realized رکورد هم اضافه کن (برای UI)
-            key = "v4" if fam == "v4" else "v6"
+
+            # برای UI: realized را آپدیت کن
+            keyfam = "v4" if fam == "v4" else "v6"
             try:
                 with filters.lock:
                     rr = filters.items.get(rec["id"])
                     if rr:
-                        arr = rr.setdefault("realized", {}).setdefault(key, [])
+                        arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
                         if dst_ip not in arr:
                             arr.append(dst_ip)
                         filters.flush()
@@ -1582,6 +1918,7 @@ class SNILearner:
 
         except Exception as e:
             print("[netdash] SNI learner error:", e)
+
 
     def start(self):
         if not SNI_LEARN_ENABLED:
@@ -1629,11 +1966,7 @@ except Exception as e:
     print("[netdash] bootstrap warning:", e)
 
 
-try:
-    sni_learner = SNILearner(ifaces=SNI_LEARN_IFACES or None)
-    sni_learner.start()
-except Exception as _e:
-    print("[netdash] cannot start SNI learner:", _e)
+
     
 #mohamamd#
 def _tc_bin():
@@ -2478,6 +2811,41 @@ HTML = r"""
 
 
 # ------------------ Routes ------------------
+@app.route("/api/sni-index/<base>")
+def api_sni_index_base(base):
+    base = (base or "").strip().lower().strip(".")
+    v4, v6 = sni_index.get_ips_for_base(base)
+    return jsonify({"base": base, "v4": v4, "v6": v6})
+
+@app.route("/api/debug/why-ip/<ip>")
+def api_debug_why_ip(ip):
+    ip = (ip or "").strip()
+    in_sets = []
+    for name in (IPSET4, IPSET4P, IPSET6, IPSET6P):
+        try:
+            if _run_root(["ipset","test", name, ip]) == 0:
+                in_sets.append(name)
+        except Exception:
+            pass
+
+    # چه دامنه‌هایی الان بلاک هستند؟
+    with filters.lock:
+        blocks = [ (r.get("id"), r.get("pattern")) for r in filters.items.values() if r and _split_family(r.get("pattern","")) is None ]
+
+    # این IP در sni-index متعلق به کدام baseها بوده؟
+    seen_in = []
+    try:
+        for bid, pat in blocks:
+            base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat
+            v4, v6 = sni_index.get_ips_for_base(base)
+            if ip in v4 or ip in v6:
+                seen_in.append(base)
+    except Exception:
+        pass
+
+    return jsonify({"ip": ip, "in_sets": in_sets, "seen_in_bases": seen_in, "blocked_domains_now": [p for _,p in blocks]})
+
+
 @app.route("/")
 def home():
     html = render_template_string(HTML, max_points=MAX_POINTS, token=CONTROL_TOKEN)
@@ -2612,6 +2980,11 @@ def _flush_on_exit():
 
 if __name__ == "__main__":
     try:
-        app.run(host=HOST, port=PORT, debug=False)
+        monitor.start()
+        start_block_server()
+        sni_learner = SNILearner(ifaces=SNI_LEARN_IFACES or None)
+        sni_learner.start()
+        app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
     finally:
         _flush_on_exit()
+
