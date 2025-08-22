@@ -1727,7 +1727,7 @@ HTML = r"""
     <div class="card p-4 bg-white dark:bg-gray-800 mb-4">
       <div class="flex items-center justify-between mb-3">
         <div class="font-semibold">مسدودسازی آدرس‌ها (بلاک‌لیست)</div>
-        <div class="text-xs opacity-70">قوانین سطح سیستم (iptables)</div>
+        <div class="text-xs opacity-70">قوانین سطح سیستم</div>
       </div>
 
       <!-- فرم -->
