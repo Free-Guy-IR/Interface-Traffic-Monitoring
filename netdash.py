@@ -19,12 +19,26 @@ HOST          = "0.0.0.0"
 PORT          = int(os.environ.get("NETDASH_PORT", "18080"))
 BLOCK_PORT    = int(os.environ.get("NETDASH_BLOCK_PORT", "18081"))
 FLUSH_SETS_ON_REMOVE = os.environ.get("NETDASH_FLUSH_SETS_ON_REMOVE","1").lower() in ("1","true","yes","on")
+
 # --- toggle for block page mode (redirect http to 451) ---
-PAGE_MODE_ENABLED = os.environ.get("NETDASH_PAGE_MODE", "0").lower() in ("1","true","yes","on")
-SNI_BLOCK_ENABLED = os.environ.get("NETDASH_SNI_BLOCK","0").lower() in ("1","true","yes","on")
 ENABLE_PAGE_MODE = os.environ.get("NETDASH_ENABLE_PAGE_MODE","0").lower() in ("1","true","yes","on")
-SNI_LEARN_ENABLED = os.environ.get("NETDASH_SNI_LEARN","0").lower() in ("1","true","yes","on")
+
+# حالت پیش‌فرض: ipset+dnsmasq روشن، SNI روشن، صفحهٔ مسدودی روشن
+USE_DNSMASQ_IPSET = os.environ.get("NETDASH_IPSET_MODE","1").lower() in ("1","true","yes","on")
+SNI_BLOCK_ENABLED = os.environ.get("NETDASH_SNI_BLOCK","1").lower() in ("1","true","yes","on")
+PAGE_MODE_ENABLED = os.environ.get("NETDASH_PAGE_MODE","1").lower() in ("1","true","yes","on")
+SNI_LEARN_ENABLED = os.environ.get("NETDASH_SNI_LEARN","1").lower() in ("1","true","yes","on")
+
+# اتوماسیون‌های بوت‌استرپ (برای اینکه هیچ دستور دستی لازم نشود)
+AUTO_ENFORCE_DNS = os.environ.get("NETDASH_ENFORCE_DNS","1").lower() in ("1","true","yes","on")
+AUTO_BLOCK_DOT   = os.environ.get("NETDASH_BLOCK_DOT","1").lower() in ("1","true","yes","on")
+AUTO_PRELOAD_META= os.environ.get("NETDASH_PRELOAD_META","1").lower() in ("1","true","yes","on")
+AUTO_PIP_INSTALL = os.environ.get("NETDASH_AUTO_PIP","1").lower() in ("1","true","yes","on")
+# --- toggle for block page mode (redirect http to 451) ---
 SNI_LEARN_IFACES  = [x.strip() for x in os.environ.get("NETDASH_SNI_IFACES","").split(",") if x.strip()]
+
+
+
 
 
 # control (pause/resume)
@@ -34,7 +48,6 @@ DENY_IFACES     = {x.strip() for x in os.environ.get("NETDASH_DENY", "").split("
 ALLOW_IFACES    = {x.strip() for x in os.environ.get("NETDASH_ALLOW", "").split(",") if x.strip()}
 
 # --- ipset + dnsmasq mode (on by default) ---
-USE_DNSMASQ_IPSET = os.environ.get("NETDASH_IPSET_MODE","1").lower() in ("1","true","yes","on")
 IPSET4   = os.environ.get("NETDASH_IPSET4","nd-bl4")        # drop set (IPv4)
 IPSET6   = os.environ.get("NETDASH_IPSET6","nd-bl6")        # drop set (IPv6)
 IPSET4P  = os.environ.get("NETDASH_IPSET4_PAGE","ndp-bl4")  # page set (IPv4, HTTP redirect)
@@ -46,9 +59,20 @@ DNSMASQ_CONF  = os.environ.get("NETDASH_DNSMASQ_CONF","/etc/dnsmasq.d/netdash-bl
 app = Flask(__name__)
 
 
+def _try_modprobe(mod):
+    try:
+        cmd = ["modprobe", mod]
+        if os.geteuid() != 0:
+            cmd = ["sudo","-n"] + cmd
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 
 # ---- Block Page Mini-Server (HTTP only) ----
 blockapp = Flask("netdash_block")
+
+_try_modprobe("xt_string")
 
 BLOCK_PAGE_HTML = r"""
 <!doctype html>
@@ -128,7 +152,7 @@ def blocked_any(path):
     host = request.headers.get("Host","")
     return render_template_string(BLOCK_PAGE_HTML, host=host), 451
 
-def start_block_server():
+def monitor.start():
     def run(host):
         blockapp.run(host=host, port=BLOCK_PORT, debug=False, use_reloader=False)
     threading.Thread(target=run, args=("0.0.0.0",), daemon=True).start()
@@ -618,6 +642,17 @@ monitor = NetMonitor(POLL_INTERVAL)
 monitor.start()
 start_block_server()
 
+try:
+    if USE_DNSMASQ_IPSET:
+        ensure_ipset_and_rules()      # ست‌ها و قوانین پایه
+    if AUTO_ENFORCE_DNS:
+        _ensure_dns_redirection()     # اجبار DNS به dnsmasq محلی
+    if AUTO_BLOCK_DOT:
+        _ensure_block_dot()           # بستن DoT
+    if AUTO_PRELOAD_META:
+        _preload_blocklist()          # افزودن دامنه‌های پیش‌فرض
+except Exception as e:
+    print("[netdash] bootstrap warning:", e)
 # ------------------ Controls ------------------
 def _find_ip_binary():
     for p in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "ip"):
@@ -733,6 +768,9 @@ def _run_root(cmd):
         return 0
     except subprocess.CalledProcessError:
         return 1
+        
+  
+        
 
 def _ipt_ensure(args, table=None, v6=False):
     base = ["ip6tables"] if v6 else ["iptables"]
@@ -744,25 +782,23 @@ def _ipt_ensure(args, table=None, v6=False):
         _run_root(insert)
 
 def ensure_ipset_and_rules():
-    # sets
-    for name,fam in ((IPSET4,"inet"),(IPSET6,"inet6"),(IPSET4P,"inet"),(IPSET6P,"inet6")):
-        _run_root(["ipset","create",name,"hash:net","family",fam,"timeout",str(IPSET_TIMEOUT),"-exist"])
+    # 1) بساز/مطمئن شو ipsetها هستند
+    _run_root(["ipset","create",IPSET4,"hash:net","family","inet","timeout",str(IPSET_TIMEOUT),"-exist"])
+    _run_root(["ipset","create",IPSET6,"hash:net","family","inet6","timeout",str(IPSET_TIMEOUT),"-exist"])
+    _run_root(["ipset","create",IPSET4P,"hash:net","family","inet","timeout",str(IPSET_TIMEOUT),"-exist"])
+    _run_root(["ipset","create",IPSET6P,"hash:net","family","inet6","timeout",str(IPSET_TIMEOUT),"-exist"])
 
-def ensure_ipset_and_rules():
-    # ...
-    # DROP برای nd-* همیشه لازم است:
+    # 2) قواعد DROP/REDIRECT
     _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET4,"dst","-j","DROP"])
     _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET4,"dst","-j","DROP"])
     _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET6,"dst","-j","DROP"], v6=True)
     _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET6,"dst","-j","DROP"], v6=True)
 
-    # اگر page-mode روشن است، ndp-* را DROP نکن؛ فقط NAT redirect روی 80 بزن.
     if PAGE_MODE_ENABLED:
         for ch in ("OUTPUT","PREROUTING"):
             _ipt_ensure([ch,"-p","tcp","-m","set","--match-set",IPSET4P,"dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat")
             _ipt_ensure([ch,"-p","tcp","-m","set","--match-set",IPSET6P,"dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat", v6=True)
     else:
-        # اگر page-mode خاموش است، ndp-* هم مثل بقیه DROP شود
         _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET4P,"dst","-j","DROP"])
         _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET4P,"dst","-j","DROP"])
         _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET6P,"dst","-j","DROP"], v6=True)
@@ -776,6 +812,67 @@ def _dnsmasq_hup():
         _run_root(["systemctl","reload","dnsmasq"])
 
 
+# --- Helper: تشخیص اینترفیس‌های LAN با IPv4 خصوصی ---
+def _is_private_ipv4_cidr(cidr):
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+        return net.version == 4 and (net.is_private or str(net).startswith("100.64."))
+    except Exception:
+        return False
+
+def _lan_ifaces_guess():
+    lans = []
+    try:
+        for it in get_interfaces_info():
+            if not it.get("is_up"): 
+                continue
+            n = it.get("name","")
+            if n.startswith("lo"): 
+                continue
+            addrs = it.get("addresses") or []
+            if any(_is_private_ipv4_cidr(a.get("cidr","")) for a in addrs):
+                lans.append(n)
+    except Exception:
+        pass
+    return lans
+
+# --- ENFORCE DNS: همهٔ درخواست‌های 53 به dnsmasq لوکال برود ---
+def _ensure_dns_redirection():
+    # برای پروسه‌های همین ماشین
+    for proto in ("udp","tcp"):
+        _ipt_ensure(["OUTPUT","-p",proto,"--dport","53","-j","REDIRECT","--to-ports","53"], table="nat")
+    # برای کلاینت‌های LAN
+    for lan in _lan_ifaces_guess():
+        for proto in ("udp","tcp"):
+            _ipt_ensure(["PREROUTING","-i",lan,"-p",proto,"--dport","53","-j","REDIRECT","--to-ports","53"], table="nat")
+
+# --- BLOCK DoT (TCP/853) هم برای خروجی خود میزبان هم عبوری روتر ---
+def _ensure_block_dot():
+    for v6 in (False, True):
+        for ch in ("OUTPUT","FORWARD"):
+            _ipt_ensure([ch,"-p","tcp","--dport","853","-j","REJECT"], v6=v6)
+
+# --- لیست آماده: دامنه‌های متا و چند ارائه‌دهندهٔ DoH ---
+DEFAULT_BLOCKS = [
+    # Meta
+    "instagram.com","cdninstagram.com","facebook.com","facebook.net","fbcdn.net",
+    "whatsapp.com","whatsapp.net",
+    # DoH providers (نمونه‌های متداول)
+    "dns.google","cloudflare-dns.com","one.one.one.one","quad9.net","dns.quad9.net",
+    "adguard-dns.com","nextdns.io","dns.nextdns.io","dns.sb","doh.opendns.com"
+]
+
+def _preload_blocklist():
+    existing = set()
+    with filters.lock:
+        existing = { (it or {}).get("pattern","").strip().lower() for it in (filters.items or {}).values() }
+    for dom in DEFAULT_BLOCKS:
+        if dom not in existing:
+            try:
+                # show_page=False: سِروِر را drop می‌کنیم (HTTPS). SNI هم auto اضافه می‌شود.
+                filters.add(dom, show_page=False)
+            except Exception as e:
+                print("[netdash] preload add failed:", dom, e)
 
 
 
@@ -1082,28 +1179,32 @@ def _normalize_domain(pat: str) -> str:
     d = _normalize_domain_or_none(pat)  # همون که قبلاً اضافه کردی
     return d if d is not None else (pat or "").strip().lower()
 
-def _add_sni_rules_for_domain(domain: str):
-    """اتصالات NEW روی 443/TCP را اگر SNI شامل domain بود DROP می‌کند (همهٔ ساب‌دامنه‌ها)."""
+def _add_sni_rules_for_domain(domain: str, iface: str | None = None):
+    """اتصالات NEW روی 443/TCP را اگر SNI شامل domain بود DROP می‌کند (همهٔ ساب‌دامنه‌ها).
+       اگر iface داده شود، قانون فقط روی همان خروجی (-o iface) اعمال می‌شود."""
     rules = []
     dom = _normalize_domain(domain)
     if not dom:
         return rules
-
     for ipv6 in (False, True):
         binp = _iptables_bin(ipv6)
         for chain in ("FORWARD", "OUTPUT"):
-            # اول چک کن وجود نداشته باشد (-C)، بعد درج (-I)
-            cmd_insert = [binp, "-I", chain, "-p", "tcp", "--dport", "443",
-                          "-m", "conntrack", "--ctstate", "NEW",
-                          "-m", "string", "--string", dom, "--algo", "bm",
-                          "-j", "DROP"]
+            cmd_insert = [binp, "-I", chain]
+            if iface:
+                cmd_insert += ["-o", iface]
+            cmd_insert += [
+                "-p", "tcp", "--dport", "443",
+                "-m", "conntrack", "--ctstate", "NEW",
+                "-m", "string", "--string", dom, "--algo", "bm",
+                "-j", "DROP"
+            ]
             cmd_check = _chk_equivalent(cmd_insert)
             if _run_root(_sudo_wrap(cmd_check)) == 0:
-                # قبلاً هست؛ دوباره درج نکن
                 continue
             if _run_root(_sudo_wrap(cmd_insert)) == 0:
                 rules.append({"cmd": cmd_insert, "chain": chain, "ipv6": ipv6})
     return rules
+
 
 def _del_rule_obj(r):
     """قانون ذخیره‌شده را حذف می‌کند (معادل -D از روی -I)."""
@@ -1161,7 +1262,8 @@ class FilterStore:
                     pat = (rec or {}).get("pattern", "").strip()
                     if pat and _split_family(pat) is None:
                         try:
-                            rec["sni_rules"] = _add_sni_rules_for_domain(pat)
+                            rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=(rec.get("iface") or None))
+
                         except Exception as e:
                             print(f"[netdash] SNI add failed for {pat}: {e}")
                 self.flush()
@@ -1227,7 +1329,10 @@ class FilterStore:
                     self.flush()
                 _rebuild_dnsmasq_conf_from_items(self.items)
                 if SNI_BLOCK_ENABLED:
-                    rec["sni_rules"] = _add_sni_rules_for_domain(pat)
+                    rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
+                    
+
+
                     with self.lock:
                         self.items[fid] = rec
                         self.flush()
@@ -1284,6 +1389,12 @@ class FilterStore:
             raise RuntimeError("هیچ قانون iptables/ip6tables اعمال نشد.")
         rec["rules"] = rules
         rec["realized"] = {"v4": v4, "v6": v6}
+        if SNI_BLOCK_ENABLED and fam is None:
+            try:
+                rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
+            except Exception:
+                pass
+                
         with self.lock:
             self.items[fid] = rec
             self.flush()
@@ -1479,15 +1590,24 @@ class SNILearner:
         try:
             from scapy.all import sniff
         except Exception as e:
-            print("[netdash] SNI learner disabled: scapy not available:", e)
-            return
-
+            if AUTO_PIP_INSTALL:
+                try:
+                    import sys, subprocess
+                    subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", "scapy"])
+                    from scapy.all import sniff
+                except Exception as e2:
+                    print("[netdash] SNI learner disabled: scapy install failed:", e2)
+                    return
+            else:
+                print("[netdash] SNI learner disabled: scapy not available:", e)
+                return
+    
         self.running = True
         def run():
             flt = "tcp dst port 443"
             kwargs = {"filter": flt, "prn": self._handle_packet, "store": False}
             if self.ifaces:
-                kwargs["iface"] = self.ifaces  # لیست یا تک‌نام
+                kwargs["iface"] = self.ifaces
             print(f"[netdash] SNI learner started on: {self.ifaces or 'ALL'}")
             try:
                 sniff(**kwargs)
