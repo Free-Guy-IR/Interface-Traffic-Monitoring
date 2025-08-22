@@ -32,7 +32,9 @@ SNI_LEARN_ENABLED = os.environ.get("NETDASH_SNI_LEARN","1").lower() in ("1","tru
 # اتوماسیون‌های بوت‌استرپ (برای اینکه هیچ دستور دستی لازم نشود)
 AUTO_ENFORCE_DNS = os.environ.get("NETDASH_ENFORCE_DNS","1").lower() in ("1","true","yes","on")
 AUTO_BLOCK_DOT   = os.environ.get("NETDASH_BLOCK_DOT","1").lower() in ("1","true","yes","on")
-AUTO_PRELOAD_META= os.environ.get("NETDASH_PRELOAD_META","1").lower() in ("1","true","yes","on")
+
+AUTO_PRELOAD_META = os.environ.get("NETDASH_PRELOAD_META","0").lower() in ("1","true","yes","on")
+
 AUTO_PIP_INSTALL = os.environ.get("NETDASH_AUTO_PIP","1").lower() in ("1","true","yes","on")
 # --- toggle for block page mode (redirect http to 451) ---
 SNI_LEARN_IFACES  = [x.strip() for x in os.environ.get("NETDASH_SNI_IFACES","").split(",") if x.strip()]
@@ -152,7 +154,7 @@ def blocked_any(path):
     host = request.headers.get("Host","")
     return render_template_string(BLOCK_PAGE_HTML, host=host), 451
 
-def monitor.start():
+def start_block_server():
     def run(host):
         blockapp.run(host=host, port=BLOCK_PORT, debug=False, use_reloader=False)
     threading.Thread(target=run, args=("0.0.0.0",), daemon=True).start()
@@ -161,8 +163,6 @@ def monitor.start():
             threading.Thread(target=run, args=("::",), daemon=True).start()
     except Exception:
         pass
-
-
 
 
 
