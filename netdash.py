@@ -238,6 +238,10 @@ DATA_HOME = _pick_data_home()
 SNI_LOG_FILE = os.path.join(DATA_HOME, "sni-seen.log")
 SNI_INDEX_FILE = os.path.join(DATA_HOME, "sni-index.json")
 SNI_INDEX_PRESEED_ON_ADD = True
+
+# رجیستر تجمیعی آیتم‌ها + IPهای resolved
+BLOCKS_REG_FILE = os.path.join(DATA_HOME, "blocks_registry.json")
+
 _SNI_LOG_LOCK = threading.Lock()
 
 FILTERS_FILE = os.path.join(DATA_HOME, "filters.json")
@@ -738,8 +742,161 @@ class PeriodStore:
                 key = time.strftime("%Y-%m", time.localtime())
                 data = self.months.get(key, {})
             return key, data
+            
+            
+            
+class BlocksRegistry:
+    """
+    ساختار فایل blocks_registry.json:
+    {
+      "v": 1,
+      "items": {
+        "<filter_id>": {
+          "id": "...",
+          "pattern": "instagram.com" | "203.0.113.0/24" | "1.2.3.4",
+          "iface": "eth0" | null,   # null یعنی همه اینترفیس‌ها
+          "proto": "all" | "tcp" | "udp",
+          "port":  null | 443 | ...,
+          "created": 1712345678,
+          "show_page": true|false,
+          "realized": { "v4": [...], "v6": [...] }
+        }
+      }
+    }
+    """
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.lock = threading.Lock()
+        self.obj = {"v": 1, "items": {}}
+        self._last_flush = 0.0
+        self.flush_interval = 2.0
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                o = json.load(f)
+            if isinstance(o, dict) and "items" in o:
+                self.obj = o
+        except Exception:
+            self.obj = {"v": 1, "items": {}}
+
+    def flush(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_flush) < self.flush_interval:
+            return
+        with self.lock:
+            data = json.loads(json.dumps(self.obj, ensure_ascii=False))
+        tmp = self.filepath + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.filepath)
+            self._last_flush = now
+        except Exception:
+            pass
+
+    def _ensure_item(self, fid):
+        it = self.obj["items"].get(fid)
+        if not it:
+            it = {"id": fid, "pattern": None, "iface": None, "proto": "all",
+                  "port": None, "created": int(time.time()), "show_page": False,
+                  "realized": {"v4": [], "v6": []}}
+            self.obj["items"][fid] = it
+        if "realized" not in it:
+            it["realized"] = {"v4": [], "v6": []}
+        return it
+
+    def upsert_from_rec(self, rec: dict):
+        if not rec: return
+        fid = rec.get("id")
+        if not fid: return
+        with self.lock:
+            it = self._ensure_item(fid)
+            it["pattern"]   = rec.get("pattern")
+            it["iface"]     = rec.get("iface") or None
+            it["proto"]     = (rec.get("proto") or "all").lower()
+            it["port"]      = rec.get("port")
+            it["show_page"] = bool(rec.get("show_page"))
+            it["created"]   = int(rec.get("created") or it.get("created") or int(time.time()))
+            rv4 = list((rec.get("realized") or {}).get("v4") or [])
+            rv6 = list((rec.get("realized") or {}).get("v6") or [])
+            it["realized"]["v4"] = sorted(set(it["realized"]["v4"]) | set(rv4))
+            it["realized"]["v6"] = sorted(set(it["realized"]["v6"]) | set(rv6))
+        self.flush()
+
+    def set_realized(self, fid: str, v4: list, v6: list):
+        with self.lock:
+            it = self._ensure_item(fid)
+            it["realized"]["v4"] = sorted(set(v4 or []))
+            it["realized"]["v6"] = sorted(set(v6 or []))
+        self.flush()
+
+    def add_realized_ip(self, fid: str, fam: str, ip: str):
+        if fam not in ("v4","v6") or not ip: return
+        with self.lock:
+            it = self._ensure_item(fid)
+            arr = it["realized"][fam]
+            if ip not in arr:
+                arr.append(ip)
+        self.flush()
+
+    def remove(self, fid: str):
+        with self.lock:
+            self.obj["items"].pop(fid, None)
+        self.flush()
+
+            
 
 periods = PeriodStore(PERIOD_FILE)
+blocksreg = BlocksRegistry(BLOCKS_REG_FILE)
+
+
+def _sync_registry_for(fid: str):
+
+    """همگام‌سازی رجیستری برای یک آیتم بر اساس همان دیتایی که ستون Resolved از آن استفاده می‌کند."""
+    if not fid:
+        return
+    with filters.lock:
+        rec = filters.items.get(fid)
+    if not rec:
+        return
+
+    # از همون realized که UI استفاده می‌کنه بخون
+    rv4 = list(((rec.get("realized") or {}).get("v4") or []))
+    rv6 = list(((rec.get("realized") or {}).get("v6") or []))
+
+    # اگر دامنه است، IPهای sni_index را هم ادغام کن تا کامل‌تر شود
+    pat = (rec.get("pattern") or "").strip()
+    if pat and _split_family(pat) is None:
+        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
+        v4i, v6i = sni_index.get_ips_for_base(base)
+        rv4 = sorted(set(rv4) | set(v4i or []))
+        rv6 = sorted(set(rv6) | set(v6i or []))
+
+    # اول خود رکورد را بالا ببر داخل رجیستری، بعد realized را ست کن
+    try:
+        blocksreg.upsert_from_rec(rec)
+    except Exception:
+        pass
+    blocksreg.set_realized(fid, rv4, rv6)
+
+
+def _start_registry_autosync(interval=5.0):
+    def loop():
+        while True:
+            try:
+                with filters.lock:
+                    ids = [it.get("id") for it in (filters.items or {}).values() if it and it.get("id")]
+                for fid in ids:
+                    _sync_registry_for(fid)
+            except Exception as e:
+                print("[netdash] autosync warn:", e)
+            time.sleep(interval)
+    threading.Thread(target=loop, daemon=True).start()
+
+
+
 
 # ------------------ Monitor ------------------
 class NetMonitor:
@@ -1560,6 +1717,15 @@ class FilterStore:
 
         with self.lock:
             self.items = items
+        
+        # رجیستر را با آیتم‌های موجود همگام کن
+        try:
+            for _rec in items.values():
+                blocksreg.upsert_from_rec(_rec)
+                _sync_registry_for(_rec["id"])   # ← این خط را اضافه کن
+                        
+        except Exception:
+            pass
 
         # --- بازگردانی state کرنل در بوت ---
         if USE_DNSMASQ_IPSET:
@@ -1646,6 +1812,11 @@ class FilterStore:
                 with self.lock:
                     self.items[fid] = rec
                     self.flush()
+                try:
+                    blocksreg.upsert_from_rec(rec)
+                except Exception:
+                    pass
+                                    
             
                 _rebuild_dnsmasq_conf_from_items(self.items)
             
@@ -1660,6 +1831,16 @@ class FilterStore:
                         with self.lock:
                             self.items[fid] = rec
                             self.flush()
+                        try:
+                            _sync_registry_for(fid)
+                        except Exception:
+                            pass
+                                                    
+                        try:
+                            blocksreg.upsert_from_rec(rec)
+                        except Exception:
+                            pass
+                                                
                     except Exception as e:
                         print("[netdash] preseed from index failed:", e)
             
@@ -1669,7 +1850,15 @@ class FilterStore:
                     with self.lock:
                         self.items[fid] = rec
                         self.flush()
-            
+                    try:
+                        blocksreg.upsert_from_rec(rec)
+                    except Exception:
+                        pass
+                    try:
+                        _sync_registry_for(fid)
+                    except Exception:
+                        pass
+                                
                 return rec
 
 
@@ -1686,6 +1875,11 @@ class FilterStore:
             with self.lock:
                 self.items[fid] = rec
                 self.flush()
+            try:
+                blocksreg.upsert_from_rec(rec)
+            except Exception:
+                pass
+                            
             return rec
 
         # ---- fallback: iptables per-IP (legacy) ----
@@ -1733,6 +1927,12 @@ class FilterStore:
         with self.lock:
             self.items[fid] = rec
             self.flush()
+        try:
+            blocksreg.upsert_from_rec(rec)
+        except Exception as e:
+            print("[netdash] blocksreg upsert (legacy) failed:", e)
+            
+            
         return rec
 
     def _apply_one(self, dst, iface, proto, port, chain, ipv6):
@@ -1769,14 +1969,14 @@ class FilterStore:
                 with self.lock:
                     self.items.pop(fid, None)
                     self.flush()
-        
+
                 _rebuild_dnsmasq_conf_from_items(self.items)
-        
+
                 try:
                     _del_domain_everywhere_safe(rec)
                 except Exception as e:
                     print("[netdash] safe-del warn:", e)
-        
+
                 any_domains = False
                 with self.lock:
                     for rr in self.items.values():
@@ -1785,9 +1985,14 @@ class FilterStore:
                             break
                 if not any_domains:
                     _flush_all_ipsets()
-        
-                return True
 
+                # ←← حذف از رجیستر
+                try:
+                    blocksreg.remove(fid)
+                except Exception as e:
+                    print("[netdash] blocksreg remove (domain) failed:", e)
+
+                return True
 
             # --- IP/CIDR ---
             setname = None
@@ -1800,6 +2005,13 @@ class FilterStore:
             with self.lock:
                 self.items.pop(fid, None)
                 self.flush()
+
+            # ←← حذف از رجیستر
+            try:
+                blocksreg.remove(fid)
+            except Exception as e:
+                print("[netdash] blocksreg remove (ip/cidr) failed:", e)
+
             return True
 
         # ---- legacy: حذف قوانین iptables ذخیره‌شده ----
@@ -1812,6 +2024,13 @@ class FilterStore:
         with self.lock:
             self.items.pop(fid, None)
             self.flush()
+
+        # ←← حذف از رجیستر
+        try:
+            blocksreg.remove(fid)
+        except Exception as e:
+            print("[netdash] blocksreg remove (legacy) failed:", e)
+
         return True
 
 
@@ -1912,10 +2131,23 @@ class SNILearner:
                         arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
                         if dst_ip not in arr:
                             arr.append(dst_ip)
-                        filters.flush()
+                    filters.flush()
             except Exception:
                 pass
 
+            # همون لحظه رجیستری را دقیقاً بر اساس realized آپدیت کن
+            try:
+                _sync_registry_for(rec["id"])
+            except Exception:
+                pass
+
+            # برای اطمینان، IP تک‌به‌تک را هم به رجیستری اضافه کن (اگر قبلاً نبود)
+            try:
+                blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
+            except Exception as e:
+                print("[netdash] blocksreg add_realized_ip failed:", e)
+
+                
         except Exception as e:
             print("[netdash] SNI learner error:", e)
 
@@ -2811,6 +3043,46 @@ HTML = r"""
 
 
 # ------------------ Routes ------------------
+
+@app.route("/api/debug/sync-registry-now", methods=["POST"])
+def api_debug_sync_now():
+    _require_token()
+    with filters.lock:
+        ids = [it.get("id") for it in (filters.items or {}).values() if it and it.get("id")]
+    for fid in ids:
+        _sync_registry_for(fid)
+    return jsonify({"ok": True, "n": len(ids)})
+
+
+@app.route("/api/debug/rebuild-reg", methods=["POST"])
+def api_debug_rebuild_reg():
+    _require_token()
+
+    # رجیستری را خالی کن
+    with blocksreg.lock:
+        blocksreg.obj = {"v": 1, "items": {}}
+        blocksreg.flush(force=True)
+
+    # از روی فیلترها دوباره بساز و با sni_index غنی‌سازی کن
+    with filters.lock:
+        for rec in filters.items.values():
+            try:
+                blocksreg.upsert_from_rec(rec)
+                pat = (rec.get("pattern") or "").strip()
+                if pat and _split_family(pat) is None:
+                    base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat
+                    v4i, v6i = sni_index.get_ips_for_base(base)
+                    rv4 = sorted(set((rec.get("realized") or {}).get("v4", [])) | set(v4i or []))
+                    rv6 = sorted(set((rec.get("realized") or {}).get("v6", [])) | set(v6i or []))
+                    blocksreg.set_realized(rec["id"], rv4, rv6)
+            except Exception as e:
+                print("[netdash] rebuild-reg warn:", e)
+
+    return jsonify({"ok": True, "n": len(blocksreg.obj.get('items', {}))})
+
+
+
+
 @app.route("/api/sni-index/<base>")
 def api_sni_index_base(base):
     base = (base or "").strip().lower().strip(".")
@@ -2984,6 +3256,7 @@ if __name__ == "__main__":
         start_block_server()
         sni_learner = SNILearner(ifaces=SNI_LEARN_IFACES or None)
         sni_learner.start()
+        _start_registry_autosync(interval=5.0)
         app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
     finally:
         _flush_on_exit()
