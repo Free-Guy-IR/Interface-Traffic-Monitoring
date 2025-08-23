@@ -1,123 +1,102 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import time
-import json
-import threading
-import subprocess
-import re
-from collections import deque, defaultdict
-from flask import Flask, jsonify, render_template_string, make_response, request, abort
-import socket, ipaddress, uuid, random, string
+import os 
+import time 
+import json 
+import threading 
+import subprocess 
+import re 
+from collections import deque ,defaultdict 
+from flask import Flask ,jsonify ,render_template_string ,make_response ,request ,abort 
+import socket ,ipaddress ,uuid ,random ,string 
 
-
-
-# --- registrable domain helper (base domain) ---
-try:
-    from publicsuffix2 import get_sld as _psl_get_sld
-    def _registrable_domain(host: str) -> str | None:
-        h = (host or "").strip().lower().strip(".")
-        if not h or "." not in h: return None
-        try:
-            return _psl_get_sld(h)
-        except Exception:
-            return None
-except Exception:
-    try:
-        import tldextract
-        _tldx = tldextract.TLDExtract(suffix_list_urls=None)  # از snapshot داخلی استفاده می‌کند
-        def _registrable_domain(host: str) -> str | None:
-            h = (host or "").strip().lower().strip(".")
-            if not h or "." not in h: return None
-            ext = _tldx(h)
-            if not ext.domain or not ext.suffix: return None
+try :
+    from publicsuffix2 import get_sld as _psl_get_sld 
+    def _registrable_domain (host :str )->str |None :
+        h =(host or "").strip ().lower ().strip (".")
+        if not h or "."not in h :return None 
+        try :
+            return _psl_get_sld (h )
+        except Exception :
+            return None 
+except Exception :
+    try :
+        import tldextract 
+        _tldx =tldextract .TLDExtract (suffix_list_urls =None )
+        def _registrable_domain (host :str )->str |None :
+            h =(host or "").strip ().lower ().strip (".")
+            if not h or "."not in h :return None 
+            ext =_tldx (h )
+            if not ext .domain or not ext .suffix :return None 
             return f"{ext.domain}.{ext.suffix}"
-    except Exception:
-        # fallback خیلی ساده (برخی 2nd-levelهای رایج)
-        _2nd = {"co.uk","org.uk","ac.uk","gov.uk","co.ir","ac.ir","gov.ir","com.au","net.au","org.au"}
-        def _registrable_domain(host: str) -> str | None:
-            h = (host or "").strip().lower().strip(".")
-            if not h or "." not in h: return None
-            parts = h.split(".")
-            if len(parts) < 2: return None
-            suf2 = ".".join(parts[-2:])
-            suf3 = ".".join(parts[-3:])
-            if suf2 in _2nd and len(parts) >= 3:  # خیلی ساده
-                return ".".join(parts[-3:])
-            if suf3 in _2nd and len(parts) >= 4:
-                return ".".join(parts[-4:])
-            return suf2
+    except Exception :
 
+        _2nd ={"co.uk","org.uk","ac.uk","gov.uk","co.ir","ac.ir","gov.ir","com.au","net.au","org.au"}
+        def _registrable_domain (host :str )->str |None :
+            h =(host or "").strip ().lower ().strip (".")
+            if not h or "."not in h :return None 
+            parts =h .split (".")
+            if len (parts )<2 :return None 
+            suf2 =".".join (parts [-2 :])
+            suf3 =".".join (parts [-3 :])
+            if suf2 in _2nd and len (parts )>=3 :
+                return ".".join (parts [-3 :])
+            if suf3 in _2nd and len (parts )>=4 :
+                return ".".join (parts [-4 :])
+            return suf2 
 
+POLL_INTERVAL =1.0 
+MAX_POINTS =int (os .environ .get ("NETDASH_MAX_POINTS","120"))
+HOST ="0.0.0.0"
+PORT =int (os .environ .get ("NETDASH_PORT","18080"))
+BLOCK_PORT =int (os .environ .get ("NETDASH_BLOCK_PORT","18081"))
+FLUSH_SETS_ON_REMOVE =os .environ .get ("NETDASH_FLUSH_SETS_ON_REMOVE","1").lower ()in ("1","true","yes","on")
 
+ENABLE_PAGE_MODE =os .environ .get ("NETDASH_ENABLE_PAGE_MODE","0").lower ()in ("1","true","yes","on")
 
-# ---------------------- Config ----------------------
+USE_DNSMASQ_IPSET =os .environ .get ("NETDASH_IPSET_MODE","1").lower ()in ("1","true","yes","on")
+SNI_BLOCK_ENABLED =os .environ .get ("NETDASH_SNI_BLOCK","1").lower ()in ("1","true","yes","on")
+PAGE_MODE_ENABLED =os .environ .get ("NETDASH_PAGE_MODE","1").lower ()in ("1","true","yes","on")
+SNI_LEARN_ENABLED =os .environ .get ("NETDASH_SNI_LEARN","1").lower ()in ("1","true","yes","on")
 
-POLL_INTERVAL = 1.0   # seconds
-MAX_POINTS    = int(os.environ.get("NETDASH_MAX_POINTS", "120"))
-HOST          = "0.0.0.0"
-PORT          = int(os.environ.get("NETDASH_PORT", "18080"))
-BLOCK_PORT    = int(os.environ.get("NETDASH_BLOCK_PORT", "18081"))
-FLUSH_SETS_ON_REMOVE = os.environ.get("NETDASH_FLUSH_SETS_ON_REMOVE","1").lower() in ("1","true","yes","on")
+AUTO_ENFORCE_DNS =os .environ .get ("NETDASH_ENFORCE_DNS","1").lower ()in ("1","true","yes","on")
+AUTO_BLOCK_DOT =os .environ .get ("NETDASH_BLOCK_DOT","0").lower ()in ("1","true","yes","on")
 
-# --- toggle for block page mode (redirect http to 451) ---
-ENABLE_PAGE_MODE = os.environ.get("NETDASH_ENABLE_PAGE_MODE","0").lower() in ("1","true","yes","on")
+AUTO_PRELOAD_META =os .environ .get ("NETDASH_PRELOAD_META","0").lower ()in ("1","true","yes","on")
 
-# حالت پیش‌فرض: ipset+dnsmasq روشن، SNI روشن، صفحهٔ مسدودی روشن
-USE_DNSMASQ_IPSET = os.environ.get("NETDASH_IPSET_MODE","1").lower() in ("1","true","yes","on")
-SNI_BLOCK_ENABLED = os.environ.get("NETDASH_SNI_BLOCK","1").lower() in ("1","true","yes","on")
-PAGE_MODE_ENABLED = os.environ.get("NETDASH_PAGE_MODE","1").lower() in ("1","true","yes","on")
-SNI_LEARN_ENABLED = os.environ.get("NETDASH_SNI_LEARN","1").lower() in ("1","true","yes","on")
+AUTO_PIP_INSTALL =os .environ .get ("NETDASH_AUTO_PIP","1").lower ()in ("1","true","yes","on")
 
-# اتوماسیون‌های بوت‌استرپ (برای اینکه هیچ دستور دستی لازم نشود)
-AUTO_ENFORCE_DNS = os.environ.get("NETDASH_ENFORCE_DNS","1").lower() in ("1","true","yes","on")
-AUTO_BLOCK_DOT = os.environ.get("NETDASH_BLOCK_DOT","0").lower() in ("1","true","yes","on")
+SNI_LEARN_IFACES =[x .strip ()for x in os .environ .get ("NETDASH_SNI_IFACES","").split (",")if x .strip ()]
 
+CONTROL_ENABLED =True 
+CONTROL_TOKEN =os .environ .get ("NETDASH_TOKEN","").strip ()
+DENY_IFACES ={x .strip ()for x in os .environ .get ("NETDASH_DENY","").split (",")if x .strip ()}
+ALLOW_IFACES ={x .strip ()for x in os .environ .get ("NETDASH_ALLOW","").split (",")if x .strip ()}
 
-AUTO_PRELOAD_META = os.environ.get("NETDASH_PRELOAD_META","0").lower() in ("1","true","yes","on")
+IPSET4 =os .environ .get ("NETDASH_IPSET4","nd-bl4")
+IPSET6 =os .environ .get ("NETDASH_IPSET6","nd-bl6")
+IPSET4P =os .environ .get ("NETDASH_IPSET4_PAGE","ndp-bl4")
+IPSET6P =os .environ .get ("NETDASH_IPSET6_PAGE","ndp-bl6")
+IPSET_TIMEOUT =int (os .environ .get ("NETDASH_IPSET_TIMEOUT","3600"))
+DNSMASQ_CONF =os .environ .get ("NETDASH_DNSMASQ_CONF","/etc/dnsmasq.d/netdash-blocks.conf")
 
-AUTO_PIP_INSTALL = os.environ.get("NETDASH_AUTO_PIP","1").lower() in ("1","true","yes","on")
-# --- toggle for block page mode (redirect http to 451) ---
-SNI_LEARN_IFACES  = [x.strip() for x in os.environ.get("NETDASH_SNI_IFACES","").split(",") if x.strip()]
+app =Flask (__name__ )
 
+def _try_modprobe (mod ):
+    try :
+        cmd =["modprobe",mod ]
+        if os .geteuid ()!=0 :
+            cmd =["sudo","-n"]+cmd 
+        subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+    except Exception :
+        pass 
 
+blockapp =Flask ("netdash_block")
 
+_try_modprobe ("xt_string")
 
-# control (pause/resume)
-CONTROL_ENABLED = True
-CONTROL_TOKEN   = os.environ.get("NETDASH_TOKEN", "").strip()
-DENY_IFACES     = {x.strip() for x in os.environ.get("NETDASH_DENY", "").split(",") if x.strip()}
-ALLOW_IFACES    = {x.strip() for x in os.environ.get("NETDASH_ALLOW", "").split(",") if x.strip()}
-
-# --- ipset + dnsmasq mode (on by default) ---
-IPSET4   = os.environ.get("NETDASH_IPSET4","nd-bl4")        # drop set (IPv4)
-IPSET6   = os.environ.get("NETDASH_IPSET6","nd-bl6")        # drop set (IPv6)
-IPSET4P  = os.environ.get("NETDASH_IPSET4_PAGE","ndp-bl4")  # page set (IPv4, HTTP redirect)
-IPSET6P  = os.environ.get("NETDASH_IPSET6_PAGE","ndp-bl6")  # page set (IPv6, HTTP redirect)
-IPSET_TIMEOUT = int(os.environ.get("NETDASH_IPSET_TIMEOUT","3600"))
-DNSMASQ_CONF  = os.environ.get("NETDASH_DNSMASQ_CONF","/etc/dnsmasq.d/netdash-blocks.conf")
-# ----------------------------------------------------
-
-app = Flask(__name__)
-
-
-def _try_modprobe(mod):
-    try:
-        cmd = ["modprobe", mod]
-        if os.geteuid() != 0:
-            cmd = ["sudo","-n"] + cmd
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-
-# ---- Block Page Mini-Server (HTTP only) ----
-blockapp = Flask("netdash_block")
-
-_try_modprobe("xt_string")
-
-BLOCK_PAGE_HTML = r"""
+BLOCK_PAGE_HTML =r"""
 <!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -183,2334 +162,2057 @@ BLOCK_PAGE_HTML = r"""
 </html>
 """
 
-@blockapp.after_request
-def _no_cache(resp):
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
-    return resp
+@blockapp .after_request 
+def _no_cache (resp ):
+    resp .headers ["Cache-Control"]="no-store, max-age=0"
+    return resp 
 
-@blockapp.route("/", defaults={"path": ""})
-@blockapp.route("/<path:path>")
-def blocked_any(path):
-    host = request.headers.get("Host","")
-    return render_template_string(BLOCK_PAGE_HTML, host=host), 451
+@blockapp .route ("/",defaults ={"path":""})
+@blockapp .route ("/<path:path>")
+def blocked_any (path ):
+    host =request .headers .get ("Host","")
+    return render_template_string (BLOCK_PAGE_HTML ,host =host ),451 
 
-def start_block_server():
-    if getattr(start_block_server, "_started", False):
-        return
-    start_block_server._started = True
+def start_block_server ():
+    if getattr (start_block_server ,"_started",False ):
+        return 
+    start_block_server ._started =True 
 
-    def run_once(host):
-        try:
-            blockapp.run(host=host, port=BLOCK_PORT, debug=False, use_reloader=False)
-        except OSError as e:
-            print(f"[netdash] block server bind failed on {host}:{BLOCK_PORT}: {e}")
+    def run_once (host ):
+        try :
+            blockapp .run (host =host ,port =BLOCK_PORT ,debug =False ,use_reloader =False )
+        except OSError as e :
+            print (f"[netdash] block server bind failed on {host}:{BLOCK_PORT}: {e}")
 
-    host = "::" if socket.has_ipv6 else "0.0.0.0"
-    # تلاش برای IPv6 (دو-استک). اگر ارور داد، روی IPv4 امتحان کن.
-    t = threading.Thread(target=run_once, args=(host,), daemon=True)
-    t.start()
+    host ="::"if socket .has_ipv6 else "0.0.0.0"
 
+    t =threading .Thread (target =run_once ,args =(host ,),daemon =True )
+    t .start ()
 
-
-
-
-def _pick_data_home():
-    candidates = [
-        "/var/lib/netdash",
-        os.path.join(os.path.expanduser("~"), ".local", "share", "netdash"),
-        "/tmp/netdash",
-        os.getcwd(),
+def _pick_data_home ():
+    candidates =[
+    "/var/lib/netdash",
+    os .path .join (os .path .expanduser ("~"),".local","share","netdash"),
+    "/tmp/netdash",
+    os .getcwd (),
     ]
-    for d in candidates:
-        try:
-            os.makedirs(d, exist_ok=True)
-            testfile = os.path.join(d, ".wtest")
-            with open(testfile, "w") as f:
-                f.write("ok")
-            os.remove(testfile)
-            return d
-        except Exception:
-            continue
-    return os.getcwd()
+    for d in candidates :
+        try :
+            os .makedirs (d ,exist_ok =True )
+            testfile =os .path .join (d ,".wtest")
+            with open (testfile ,"w")as f :
+                f .write ("ok")
+            os .remove (testfile )
+            return d 
+        except Exception :
+            continue 
+    return os .getcwd ()
 
-# ⬅️ این سه خط باید بلافاصله بعد از تابع بالا بیاید
-DATA_HOME = _pick_data_home()
-SNI_LOG_FILE = os.path.join(DATA_HOME, "sni-seen.log")
-SNI_INDEX_FILE = os.path.join(DATA_HOME, "sni-index.json")
-SNI_INDEX_PRESEED_ON_ADD = True
+DATA_HOME =_pick_data_home ()
+SNI_LOG_FILE =os .path .join (DATA_HOME ,"sni-seen.log")
+SNI_INDEX_FILE =os .path .join (DATA_HOME ,"sni-index.json")
+SNI_INDEX_PRESEED_ON_ADD =True 
 
-# رجیستر تجمیعی آیتم‌ها + IPهای resolved
-BLOCKS_REG_FILE = os.path.join(DATA_HOME, "blocks_registry.json")
+BLOCKS_REG_FILE =os .path .join (DATA_HOME ,"blocks_registry.json")
 
-_SNI_LOG_LOCK = threading.Lock()
+_SNI_LOG_LOCK =threading .Lock ()
 
-FILTERS_FILE = os.path.join(DATA_HOME, "filters.json")
-HISTORY_FILE = os.path.join(DATA_HOME, "history.json")
-TOTALS_FILE  = os.path.join(DATA_HOME, "totals.json")
-PERIOD_FILE  = os.path.join(DATA_HOME, "period_totals.json")
+FILTERS_FILE =os .path .join (DATA_HOME ,"filters.json")
+HISTORY_FILE =os .path .join (DATA_HOME ,"history.json")
+TOTALS_FILE =os .path .join (DATA_HOME ,"totals.json")
+PERIOD_FILE =os .path .join (DATA_HOME ,"period_totals.json")
 
-
-
-def _append_sni_log(kind, host, dst_ip, fam=None, base=None, iface=None):
-    rec = {
-        "ts": int(time.time()),
-        "kind": kind,
-        "host": host,
-        "dst_ip": dst_ip,
-        "fam": fam,
-        "base": base,
-        "iface": iface,   # می‌تواند NetworkInterface باشد
+def _append_sni_log (kind ,host ,dst_ip ,fam =None ,base =None ,iface =None ):
+    rec ={
+    "ts":int (time .time ()),
+    "kind":kind ,
+    "host":host ,
+    "dst_ip":dst_ip ,
+    "fam":fam ,
+    "base":base ,
+    "iface":iface ,
     }
-    try:
-        os.makedirs(os.path.dirname(SNI_LOG_FILE), exist_ok=True)
-        # ⬅️ نکته‌ی مهم: default=str
-        line = json.dumps(rec, ensure_ascii=False, default=str)
+    try :
+        os .makedirs (os .path .dirname (SNI_LOG_FILE ),exist_ok =True )
 
+        line =json .dumps (rec ,ensure_ascii =False ,default =str )
 
-        with _SNI_LOG_LOCK:
-            with open(SNI_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except Exception as e:
-        print("[netdash] SNI log error:", e)
+        with _SNI_LOG_LOCK :
+            with open (SNI_LOG_FILE ,"a",encoding ="utf-8")as f :
+                f .write (line +"\n")
+    except Exception as e :
+        print ("[netdash] SNI log error:",e )
 
-
-
-
-
-# ------------------ Helpers ------------------
-def _run_ip_json(args):
-    """Call `ip -json` (یا `-j`) و خروجی JSON را برگردان؛ در خطا []"""
-    ipbin = _find_ip_binary()
-    try:
-        out = subprocess.check_output([ipbin] + args, text=True)
-        return json.loads(out)
-    except Exception:
+def _run_ip_json (args ):
+    ipbin =_find_ip_binary ()
+    try :
+        out =subprocess .check_output ([ipbin ]+args ,text =True )
+        return json .loads (out )
+    except Exception :
         return []
 
+def can_control (iface :str )->bool :
+    if not CONTROL_ENABLED or not iface :
+        return False 
+    if ALLOW_IFACES :
+        return iface in ALLOW_IFACES 
+    if iface in DENY_IFACES :
+        return False 
+    return True 
 
-def can_control(iface: str) -> bool:
-    if not CONTROL_ENABLED or not iface:
-        return False
-    if ALLOW_IFACES:
-        return iface in ALLOW_IFACES
-    if iface in DENY_IFACES:
-        return False
-    return True
+def _read_file (path ,to_int =False ):
+    try :
+        with open (path ,"r")as f :
+            s =f .read ().strip ()
+        return int (s )if to_int else s 
+    except Exception :
+        return None 
 
-def _read_file(path, to_int=False):
-    try:
-        with open(path, "r") as f:
-            s = f.read().strip()
-        return int(s) if to_int else s
-    except Exception:
-        return None
+def _link_info_sysfs (iface ):
+    spd =_read_file (f"/sys/class/net/{iface}/speed",to_int =True )
+    dup =_read_file (f"/sys/class/net/{iface}/duplex")
+    if isinstance (spd ,int )and spd <0 :
+        spd =None 
+    if dup :
+        dup =dup .lower ()
+    return spd ,dup 
 
-def _link_info_sysfs(iface):
-    spd = _read_file(f"/sys/class/net/{iface}/speed", to_int=True)
-    dup = _read_file(f"/sys/class/net/{iface}/duplex")
-    if isinstance(spd, int) and spd < 0:
-        spd = None
-    if dup:
-        dup = dup.lower()
-    return spd, dup
+def _link_info_ethtool (iface ):
+    try :
+        out =subprocess .check_output (["ethtool",iface ],text =True ,stderr =subprocess .DEVNULL )
+    except Exception :
+        return None ,None 
+    m =re .search (r"Speed:\s*([0-9]+)\s*Mb/s",out )
+    spd =int (m .group (1 ))if m else None 
+    m =re .search (r"Duplex:\s*([A-Za-z!]+)",out )
+    dup =m .group (1 ).replace ("!","").lower ()if m else None 
+    if dup =="unknown":
+        dup =None 
+    return spd ,dup 
 
-def _link_info_ethtool(iface):
-    try:
-        out = subprocess.check_output(["ethtool", iface], text=True, stderr=subprocess.DEVNULL)
-    except Exception:
-        return None, None
-    m = re.search(r"Speed:\s*([0-9]+)\s*Mb/s", out)
-    spd = int(m.group(1)) if m else None
-    m = re.search(r"Duplex:\s*([A-Za-z!]+)", out)
-    dup = m.group(1).replace("!", "").lower() if m else None
-    if dup == "unknown":
-        dup = None
-    return spd, dup
+def get_link_info (iface ):
+    spd ,dup =_link_info_sysfs (iface )
+    if spd is None and dup is None :
+        es ,ed =_link_info_ethtool (iface )
+        if spd is None :
+            spd =es 
+        if dup is None :
+            dup =ed 
+    return {"speed":spd ,"duplex":dup }
 
-def get_link_info(iface):
-    spd, dup = _link_info_sysfs(iface)
-    if spd is None and dup is None:
-        es, ed = _link_info_ethtool(iface)
-        if spd is None:
-            spd = es
-        if dup is None:
-            dup = ed
-    return {"speed": spd, "duplex": dup}
-
-def get_interfaces_info():
-    links = _run_ip_json(["-json", "link"])
-    addrs = _run_ip_json(["-json", "addr"])
-    by_index = {item.get("ifindex"): item for item in links}
-    result = []
-    for item in addrs:
-        idx = item.get("ifindex")
-        li = by_index.get(idx, {})
-        name = item.get("ifname") or li.get("ifname")
-        if not name:
-            continue
-        flags = li.get("flags") or item.get("flags", [])
-        state = (li.get("operstate") or item.get("operstate") or "").upper()
-        mtu = li.get("mtu") or item.get("mtu")
-        mac = li.get("address") if li.get("link_type") != "none" else None
-        info_kind = None
-        try:
-            info_kind = (li.get("linkinfo") or {}).get("info_kind")
-        except Exception:
-            info_kind = None
-        is_up = ("UP" in (flags or [])) or (state == "UP")
-        addresses = []
-        for a in item.get("addr_info", []):
-            fam = a.get("family")
-            local = a.get("local")
-            prefix = a.get("prefixlen")
-            scope = a.get("scope")
-            if local is not None and prefix is not None:
-                addresses.append({"family": fam, "cidr": f"{local}/{prefix}", "scope": scope})
-        result.append({
-            "name": name, "ifindex": idx, "state": state or "UNKNOWN", "flags": flags or [],
-            "mtu": mtu, "mac": mac, "addresses": addresses,
-            "can_control": can_control(name), "is_up": is_up,
-            "link": get_link_info(name) if name else {"speed": None, "duplex": None},
-            "shape": tc_status(name),
-            "kind": info_kind,
+def get_interfaces_info ():
+    links =_run_ip_json (["-json","link"])
+    addrs =_run_ip_json (["-json","addr"])
+    by_index ={item .get ("ifindex"):item for item in links }
+    result =[]
+    for item in addrs :
+        idx =item .get ("ifindex")
+        li =by_index .get (idx ,{})
+        name =item .get ("ifname")or li .get ("ifname")
+        if not name :
+            continue 
+        flags =li .get ("flags")or item .get ("flags",[])
+        state =(li .get ("operstate")or item .get ("operstate")or "").upper ()
+        mtu =li .get ("mtu")or item .get ("mtu")
+        mac =li .get ("address")if li .get ("link_type")!="none"else None 
+        info_kind =None 
+        try :
+            info_kind =(li .get ("linkinfo")or {}).get ("info_kind")
+        except Exception :
+            info_kind =None 
+        is_up =("UP"in (flags or []))or (state =="UP")
+        addresses =[]
+        for a in item .get ("addr_info",[]):
+            fam =a .get ("family")
+            local =a .get ("local")
+            prefix =a .get ("prefixlen")
+            scope =a .get ("scope")
+            if local is not None and prefix is not None :
+                addresses .append ({"family":fam ,"cidr":f"{local}/{prefix}","scope":scope })
+        result .append ({
+        "name":name ,"ifindex":idx ,"state":state or "UNKNOWN","flags":flags or [],
+        "mtu":mtu ,"mac":mac ,"addresses":addresses ,
+        "can_control":can_control (name ),"is_up":is_up ,
+        "link":get_link_info (name )if name else {"speed":None ,"duplex":None },
+        "shape":tc_status (name ),
+        "kind":info_kind ,
         })
-    # include links without addresses
-    for idx, li in by_index.items():
-        name = li.get("ifname")
-        if not name or any(r["ifindex"] == idx for r in result):
-            continue
-        flags = li.get("flags", [])
-        state = (li.get("operstate") or "").upper()
-        info_kind = None
-        try:
-            info_kind = (li.get("linkinfo") or {}).get("info_kind")
-        except Exception:
-            info_kind = None
-        is_up = ("UP" in (flags or [])) or (state == "UP")
-        result.append({
-            "name": name, "ifindex": idx, "state": state or "UNKNOWN", "flags": flags,
-            "mtu": li.get("mtu"), "mac": li.get("address"), "addresses": [],
-            "can_control": can_control(name), "is_up": is_up,
-            "link": get_link_info(name) if name else {"speed": None, "duplex": None},
-            "shape": tc_status(name),
-            "kind": info_kind,
-        })
-    result.sort(key=lambda x: x["ifindex"] or 10**9)
-    return result
 
-def list_ifaces_fs():
-    try:
-        return [d for d in os.listdir("/sys/class/net") if os.path.isdir(os.path.join("/sys/class/net", d))]
-    except Exception:
+    for idx ,li in by_index .items ():
+        name =li .get ("ifname")
+        if not name or any (r ["ifindex"]==idx for r in result ):
+            continue 
+        flags =li .get ("flags",[])
+        state =(li .get ("operstate")or "").upper ()
+        info_kind =None 
+        try :
+            info_kind =(li .get ("linkinfo")or {}).get ("info_kind")
+        except Exception :
+            info_kind =None 
+        is_up =("UP"in (flags or []))or (state =="UP")
+        result .append ({
+        "name":name ,"ifindex":idx ,"state":state or "UNKNOWN","flags":flags ,
+        "mtu":li .get ("mtu"),"mac":li .get ("address"),"addresses":[],
+        "can_control":can_control (name ),"is_up":is_up ,
+        "link":get_link_info (name )if name else {"speed":None ,"duplex":None },
+        "shape":tc_status (name ),
+        "kind":info_kind ,
+        })
+    result .sort (key =lambda x :x ["ifindex"]or 10 **9 )
+    return result 
+
+def list_ifaces_fs ():
+    try :
+        return [d for d in os .listdir ("/sys/class/net")if os .path .isdir (os .path .join ("/sys/class/net",d ))]
+    except Exception :
         return []
 
-def read_counters(iface):
-    base = f"/sys/class/net/{iface}/statistics"
-    def read_one(fname):
-        try:
-            with open(os.path.join(base, fname), "r") as f:
-                return int(f.read().strip())
-        except Exception:
-            return 0
-    return read_one("rx_bytes"), read_one("tx_bytes")
+def read_counters (iface ):
+    base =f"/sys/class/net/{iface}/statistics"
+    def read_one (fname ):
+        try :
+            with open (os .path .join (base ,fname ),"r")as f :
+                return int (f .read ().strip ())
+        except Exception :
+            return 0 
+    return read_one ("rx_bytes"),read_one ("tx_bytes")
 
-# ------------------ Stores ------------------
+class SNIIndex :
+    def __init__ (self ,filepath ):
+        self .filepath =filepath 
+        self .idx ={"v":1 ,"domains":{}}
+        self .lock =threading .Lock ()
+        self ._last_flush =0.0 
+        self .flush_interval =5.0 
+        self .load ()
 
-class SNIIndex:
-    """
-    ساختار فایل:
-    {
-      "v": 1,
-      "domains": {
-        "<base>": {
-          "first_seen": int,
-          "last_seen": int,
-          "ips": {"v4": {"1.2.3.4": ts, ...}, "v6": {"2001:db8::1": ts, ...}},
-          "subs": {
-            "<fqdn>": {
-              "last_seen": int,
-              "ips": {"v4": {...}, "v6": {...}}
-            }
-          }
-        }
-      }
-    }
-    """
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.idx = {"v":1, "domains": {}}
-        self.lock = threading.Lock()
-        self._last_flush = 0.0
-        self.flush_interval = 5.0
-        self.load()
+    def load (self ):
+        try :
+            with open (self .filepath ,"r",encoding ="utf-8")as f :
+                obj =json .load (f )
+            if isinstance (obj ,dict )and "domains"in obj :
+                self .idx =obj 
+        except Exception :
+            self .idx ={"v":1 ,"domains":{}}
 
-    def load(self):
-        try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            if isinstance(obj, dict) and "domains" in obj:
-                self.idx = obj
-        except Exception:
-            self.idx = {"v":1, "domains": {}}
+    def flush (self ,force =False ):
+        now =time .time ()
+        if not force and (now -self ._last_flush )<self .flush_interval :
+            return 
+        with self .lock :
+            data =json .loads (json .dumps (self .idx ))
+        tmp =self .filepath +".tmp"
+        try :
+            with open (tmp ,"w",encoding ="utf-8")as f :
+                json .dump (data ,f ,ensure_ascii =False )
+            os .replace (tmp ,self .filepath )
+            self ._last_flush =now 
+        except Exception :
+            pass 
 
-    def flush(self, force=False):
-        now = time.time()
-        if not force and (now - self._last_flush) < self.flush_interval:
-            return
-        with self.lock:
-            data = json.loads(json.dumps(self.idx))  # اطمینان از serializable بودن
-        tmp = self.filepath + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, self.filepath)
-            self._last_flush = now
-        except Exception:
-            pass
+    def _upd_ipmap (self ,ipmap :dict ,ip :str ,ts :int ):
+        try :
+            ipmap [ip ]=int (ts )
+        except Exception :
+            pass 
 
-    def _upd_ipmap(self, ipmap: dict, ip: str, ts: int):
-        try:
-            ipmap[ip] = int(ts)
-        except Exception:
-            pass
-
-    def update(self, host: str, dst_ip: str, fam: str, iface: str | None = None, ts: int | None = None):
+    def update (self ,host :str ,dst_ip :str ,fam :str ,iface :str |None =None ,ts :int |None =None ):
         if not host or not dst_ip or fam not in ("v4","v6"):
-            return
-        base = _registrable_domain(host) or _normalize_domain_or_none(host) or host.strip().lower().strip(".")
-        if not base:
-            return
-        t = int(ts or time.time())
-        with self.lock:
-            dom = self.idx["domains"].setdefault(base, {
-                "first_seen": t, "last_seen": t,
-                "ips": {"v4": {}, "v6": {}},
-                "subs": {}
+            return 
+        base =_registrable_domain (host )or _normalize_domain_or_none (host )or host .strip ().lower ().strip (".")
+        if not base :
+            return 
+        t =int (ts or time .time ())
+        with self .lock :
+            dom =self .idx ["domains"].setdefault (base ,{
+            "first_seen":t ,"last_seen":t ,
+            "ips":{"v4":{},"v6":{}},
+            "subs":{}
             })
-            dom["last_seen"] = t
-            self._upd_ipmap(dom["ips"][fam], dst_ip, t)
-            if host != base:
-                sub = dom["subs"].setdefault(host, {"last_seen": t, "ips": {"v4": {}, "v6": {}}})
-                sub["last_seen"] = t
-                self._upd_ipmap(sub["ips"][fam], dst_ip, t)
-        self.flush()
+            dom ["last_seen"]=t 
+            self ._upd_ipmap (dom ["ips"][fam ],dst_ip ,t )
+            if host !=base :
+                sub =dom ["subs"].setdefault (host ,{"last_seen":t ,"ips":{"v4":{},"v6":{}}})
+                sub ["last_seen"]=t 
+                self ._upd_ipmap (sub ["ips"][fam ],dst_ip ,t )
+        self .flush ()
 
-    def get_ips_for_base(self, base: str):
-        base = (base or "").strip().lower().strip(".")
-        if not base: return [], []
-        v4, v6 = set(), set()
-        now = int(time.time())
-        with self.lock:
-            dom = self.idx["domains"].get(base)
-            if not dom: return [], []
-            for ip, ts in (dom.get("ips", {}).get("v4", {}) or {}).items():
-                v4.add(ip)
-            for ip, ts in (dom.get("ips", {}).get("v6", {}) or {}).items():
-                v6.add(ip)
-            for sub in (dom.get("subs") or {}).values():
-                for ip, ts in (sub.get("ips", {}).get("v4", {}) or {}).items():
-                    v4.add(ip)
-                for ip, ts in (sub.get("ips", {}).get("v6", {}) or {}).items():
-                    v6.add(ip)
-        return sorted(v4), sorted(v6)
+    def get_ips_for_base (self ,base :str ):
+        base =(base or "").strip ().lower ().strip (".")
+        if not base :return [],[]
+        v4 ,v6 =set (),set ()
+        now =int (time .time ())
+        with self .lock :
+            dom =self .idx ["domains"].get (base )
+            if not dom :return [],[]
+            for ip ,ts in (dom .get ("ips",{}).get ("v4",{})or {}).items ():
+                v4 .add (ip )
+            for ip ,ts in (dom .get ("ips",{}).get ("v6",{})or {}).items ():
+                v6 .add (ip )
+            for sub in (dom .get ("subs")or {}).values ():
+                for ip ,ts in (sub .get ("ips",{}).get ("v4",{})or {}).items ():
+                    v4 .add (ip )
+                for ip ,ts in (sub .get ("ips",{}).get ("v6",{})or {}).items ():
+                    v6 .add (ip )
+        return sorted (v4 ),sorted (v6 )
 
-sni_index = SNIIndex(SNI_INDEX_FILE)
+sni_index =SNIIndex (SNI_INDEX_FILE )
 
+class HistoryStore :
+    def __init__ (self ,filepath ,max_points =120 ):
+        self .filepath =filepath 
+        self .max_points =max_points 
+        self .hist =defaultdict (lambda :deque (maxlen =self .max_points ))
+        self .lock =threading .Lock ()
+        self ._last_flush =0.0 
+        self .flush_interval =5.0 
 
-class HistoryStore:
-    def __init__(self, filepath, max_points=120):
-        self.filepath = filepath
-        self.max_points = max_points
-        self.hist = defaultdict(lambda: deque(maxlen=self.max_points))
-        self.lock = threading.Lock()
-        self._last_flush = 0.0
-        self.flush_interval = 5.0
+    def add (self ,iface ,ts ,rx_bps ,tx_bps ):
+        with self .lock :
+            self .hist [iface ].append ((float (ts ),float (rx_bps ),float (tx_bps )))
 
-    def add(self, iface, ts, rx_bps, tx_bps):
-        with self.lock:
-            self.hist[iface].append((float(ts), float(rx_bps), float(tx_bps)))
+    def export (self ):
+        with self .lock :
+            out ={}
+            for iface ,dq in self .hist .items ():
+                ts_list =[t for (t ,_ ,_ )in dq ]
+                rx_mbps =[(rb *8.0 )/1e6 for (_ ,rb ,_ )in dq ]
+                tx_mbps =[(tb *8.0 )/1e6 for (_ ,_ ,tb )in dq ]
+                out [iface ]={"ts":ts_list ,"rx_mbps":rx_mbps ,"tx_mbps":tx_mbps }
+            return out 
 
-    def export(self):
-        with self.lock:
-            out = {}
-            for iface, dq in self.hist.items():
-                ts_list = [t for (t, _, _) in dq]
-                rx_mbps = [ (rb*8.0)/1e6 for (_, rb, _) in dq ]
-                tx_mbps = [ (tb*8.0)/1e6 for (_, _, tb) in dq ]
-                out[iface] = {"ts": ts_list, "rx_mbps": rx_mbps, "tx_mbps": tx_mbps}
-            return out
+    def flush (self ,force =False ):
+        now =time .time ()
+        if not force and (now -self ._last_flush )<self .flush_interval :
+            return 
+        with self .lock :
+            data ={iface :list (dq )for iface ,dq in self .hist .items ()}
+        try :
+            tmp =self .filepath +".tmp"
+            with open (tmp ,"w",encoding ="utf-8")as f :
+                json .dump ({"v":1 ,"max_points":self .max_points ,"data":data },f )
+            os .replace (tmp ,self .filepath )
+            self ._last_flush =now 
+        except Exception :
+            pass 
 
-    def flush(self, force=False):
-        now = time.time()
-        if not force and (now - self._last_flush) < self.flush_interval:
-            return
-        with self.lock:
-            data = {iface: list(dq) for iface, dq in self.hist.items()}
-        try:
-            tmp = self.filepath + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"v":1, "max_points": self.max_points, "data": data}, f)
-            os.replace(tmp, self.filepath)
-            self._last_flush = now
-        except Exception:
-            pass
+    def load (self ):
+        try :
+            with open (self .filepath ,"r",encoding ="utf-8")as f :
+                obj =json .load (f )
+            maxp =int (obj .get ("max_points",self .max_points ))
+            raw =obj .get ("data",{})
+            with self .lock :
+                self .max_points =maxp 
+                self .hist .clear ()
+                for iface ,arr in (raw or {}).items ():
+                    dq =deque (maxlen =self .max_points )
+                    for tup in arr :
+                        if isinstance (tup ,(list ,tuple ))and len (tup )>=3 :
+                            t ,rb ,tb =tup [0 ],tup [1 ],tup [2 ]
+                            dq .append ((float (t ),float (rb ),float (tb )))
+                    self .hist [iface ]=dq 
+        except Exception :
 
-    def load(self):
-        try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            maxp = int(obj.get("max_points", self.max_points))
-            raw  = obj.get("data", {})
-            with self.lock:
-                self.max_points = maxp
-                self.hist.clear()
-                for iface, arr in (raw or {}).items():
-                    dq = deque(maxlen=self.max_points)
-                    for tup in arr:
-                        if isinstance(tup, (list, tuple)) and len(tup) >= 3:
-                            t, rb, tb = tup[0], tup[1], tup[2]
-                            dq.append((float(t), float(rb), float(tb)))
-                    self.hist[iface] = dq
-        except Exception:
-            # اگر فایلی نبود/خراب بود، خالی شروع کن
-            with self.lock:
-                self.hist.clear()
+            with self .lock :
+                self .hist .clear ()
 
+history =HistoryStore (HISTORY_FILE ,MAX_POINTS )
+history .load ()
 
+class TotalsStore :
+    def __init__ (self ,filepath ):
+        self .filepath =filepath 
+        self .ifaces ={}
+        self .lock =threading .Lock ()
+        self ._last_flush =0.0 
+        self .flush_interval =5.0 
+        self .load ()
 
+    def load (self ):
+        try :
+            with open (self .filepath ,"r",encoding ="utf-8")as f :
+                obj =json .load (f )
+            raw_ifaces =obj .get ("ifaces",{})
+            if not isinstance (raw_ifaces ,dict ):
+                raw_ifaces ={}
+        except Exception :
+            raw_ifaces ={}
 
-
-
-history = HistoryStore(HISTORY_FILE, MAX_POINTS)
-history.load()
-
-class TotalsStore:
-    """
-    ساختار فایل totals.json:
-      {
-        "v": 1,
-        "ifaces": {
-          "<iface>": {
-            "rx_total": float,
-            "tx_total": float,
-            "last_rx": int | null,
-            "last_tx": int | null,
-            "t": float
-          }
-        }
-      }
-    """
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.ifaces = {}
-        self.lock = threading.Lock()
-        self._last_flush = 0.0
-        self.flush_interval = 5.0
-        self.load()
-
-    def load(self):
-        try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            raw_ifaces = obj.get("ifaces", {})
-            if not isinstance(raw_ifaces, dict):
-                raw_ifaces = {}
-        except Exception:
-            raw_ifaces = {}
-
-        cleaned = {}
-        for name, rec in raw_ifaces.items():
-            if not isinstance(rec, dict):
-                continue
-            cleaned[name] = {
-                "rx_total": float(rec.get("rx_total", 0.0)),
-                "tx_total": float(rec.get("tx_total", 0.0)),
-                "last_rx": (int(rec["last_rx"]) if rec.get("last_rx") is not None else None),
-                "last_tx": (int(rec["last_tx"]) if rec.get("last_tx") is not None else None),
-                "t": float(rec.get("t", 0.0)),
+        cleaned ={}
+        for name ,rec in raw_ifaces .items ():
+            if not isinstance (rec ,dict ):
+                continue 
+            cleaned [name ]={
+            "rx_total":float (rec .get ("rx_total",0.0 )),
+            "tx_total":float (rec .get ("tx_total",0.0 )),
+            "last_rx":(int (rec ["last_rx"])if rec .get ("last_rx")is not None else None ),
+            "last_tx":(int (rec ["last_tx"])if rec .get ("last_tx")is not None else None ),
+            "t":float (rec .get ("t",0.0 )),
             }
 
-        with self.lock:
-            self.ifaces = cleaned
+        with self .lock :
+            self .ifaces =cleaned 
 
-    def flush(self, force=False):
-        now = time.time()
-        if not force and (now - self._last_flush) < self.flush_interval:
-            return
-        with self.lock:
-            data = {"v": 1, "ifaces": self.ifaces}
-        try:
-            tmp = self.filepath + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, self.filepath)
-            self._last_flush = now
-        except Exception:
-            pass
+    def flush (self ,force =False ):
+        now =time .time ()
+        if not force and (now -self ._last_flush )<self .flush_interval :
+            return 
+        with self .lock :
+            data ={"v":1 ,"ifaces":self .ifaces }
+        try :
+            tmp =self .filepath +".tmp"
+            with open (tmp ,"w",encoding ="utf-8")as f :
+                json .dump (data ,f )
+            os .replace (tmp ,self .filepath )
+            self ._last_flush =now 
+        except Exception :
+            pass 
 
-    def update(self, name, rx_bytes_now, tx_bytes_now):
-        with self.lock:
-            rec = self.ifaces.get(name) or {
-                "rx_total": 0.0, "tx_total": 0.0,
-                "last_rx": None, "last_tx": None, "t": 0.0
+    def update (self ,name ,rx_bytes_now ,tx_bytes_now ):
+        with self .lock :
+            rec =self .ifaces .get (name )or {
+            "rx_total":0.0 ,"tx_total":0.0 ,
+            "last_rx":None ,"last_tx":None ,"t":0.0 
             }
 
-            # RX
-            if rec["last_rx"] is None:
-                rec["last_rx"] = int(rx_bytes_now)
-            else:
-                if rx_bytes_now >= rec["last_rx"]:
-                    rec["rx_total"] += (int(rx_bytes_now) - rec["last_rx"])
-                else:
-                    # wrap/reset
-                    rec["rx_total"] += int(rx_bytes_now)
-                rec["last_rx"] = int(rx_bytes_now)
+            if rec ["last_rx"]is None :
+                rec ["last_rx"]=int (rx_bytes_now )
+            else :
+                if rx_bytes_now >=rec ["last_rx"]:
+                    rec ["rx_total"]+=(int (rx_bytes_now )-rec ["last_rx"])
+                else :
 
-            # TX
-            if rec["last_tx"] is None:
-                rec["last_tx"] = int(tx_bytes_now)
-            else:
-                if tx_bytes_now >= rec["last_tx"]:
-                    rec["tx_total"] += (int(tx_bytes_now) - rec["last_tx"])
-                else:
-                    rec["tx_total"] += int(tx_bytes_now)
-                rec["last_tx"] = int(tx_bytes_now)
+                    rec ["rx_total"]+=int (rx_bytes_now )
+                rec ["last_rx"]=int (rx_bytes_now )
 
-            rec["t"] = time.time()
-            self.ifaces[name] = rec
-            return rec["rx_total"], rec["tx_total"]
+            if rec ["last_tx"]is None :
+                rec ["last_tx"]=int (tx_bytes_now )
+            else :
+                if tx_bytes_now >=rec ["last_tx"]:
+                    rec ["tx_total"]+=(int (tx_bytes_now )-rec ["last_tx"])
+                else :
+                    rec ["tx_total"]+=int (tx_bytes_now )
+                rec ["last_tx"]=int (tx_bytes_now )
 
+            rec ["t"]=time .time ()
+            self .ifaces [name ]=rec 
+            return rec ["rx_total"],rec ["tx_total"]
 
-totals = TotalsStore(TOTALS_FILE)
+totals =TotalsStore (TOTALS_FILE )
 
-class PeriodStore:
-    """Aggregates delta bytes into daily (YYYY-MM-DD) and monthly (YYYY-MM) buckets."""
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.days = {}
-        self.months = {}
-        self.lock = threading.Lock()
-        self._last_flush = 0.0
-        self.flush_interval = 5.0
-        self.load()
+class PeriodStore :
+    def __init__ (self ,filepath ):
+        self .filepath =filepath 
+        self .days ={}
+        self .months ={}
+        self .lock =threading .Lock ()
+        self ._last_flush =0.0 
+        self .flush_interval =5.0 
+        self .load ()
 
-    def load(self):
-        try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            self.days = obj.get("days", {})
-            self.months = obj.get("months", {})
-        except Exception:
-            self.days, self.months = {}, {}
+    def load (self ):
+        try :
+            with open (self .filepath ,"r",encoding ="utf-8")as f :
+                obj =json .load (f )
+            self .days =obj .get ("days",{})
+            self .months =obj .get ("months",{})
+        except Exception :
+            self .days ,self .months ={},{}
 
-    def flush(self, force=False):
-        now = time.time()
-        if not force and (now - self._last_flush) < self.flush_interval:
-            return
-        with self.lock:
-            data = {"v":1, "days": self.days, "months": self.months}
-        try:
-            tmp = self.filepath + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, self.filepath)
-            self._last_flush = now
-        except Exception:
-            pass
+    def flush (self ,force =False ):
+        now =time .time ()
+        if not force and (now -self ._last_flush )<self .flush_interval :
+            return 
+        with self .lock :
+            data ={"v":1 ,"days":self .days ,"months":self .months }
+        try :
+            tmp =self .filepath +".tmp"
+            with open (tmp ,"w",encoding ="utf-8")as f :
+                json .dump (data ,f )
+            os .replace (tmp ,self .filepath )
+            self ._last_flush =now 
+        except Exception :
+            pass 
 
-    def update(self, name, delta_rx, delta_tx, t=None):
-        if t is None:
-            t = time.time()
-        day = time.strftime("%Y-%m-%d", time.localtime(t))
-        mon = time.strftime("%Y-%m", time.localtime(t))
-        with self.lock:
-            d = self.days.setdefault(day, {})
-            m = self.months.setdefault(mon, {})
-            di = d.setdefault(name, {"rx": 0, "tx": 0})
-            mi = m.setdefault(name, {"rx": 0, "tx": 0})
-            di["rx"] += int(max(0, delta_rx))
-            di["tx"] += int(max(0, delta_tx))
-            mi["rx"] += int(max(0, delta_rx))
-            mi["tx"] += int(max(0, delta_tx))
+    def update (self ,name ,delta_rx ,delta_tx ,t =None ):
+        if t is None :
+            t =time .time ()
+        day =time .strftime ("%Y-%m-%d",time .localtime (t ))
+        mon =time .strftime ("%Y-%m",time .localtime (t ))
+        with self .lock :
+            d =self .days .setdefault (day ,{})
+            m =self .months .setdefault (mon ,{})
+            di =d .setdefault (name ,{"rx":0 ,"tx":0 })
+            mi =m .setdefault (name ,{"rx":0 ,"tx":0 })
+            di ["rx"]+=int (max (0 ,delta_rx ))
+            di ["tx"]+=int (max (0 ,delta_tx ))
+            mi ["rx"]+=int (max (0 ,delta_rx ))
+            mi ["tx"]+=int (max (0 ,delta_tx ))
 
-    def get_scope(self, scope):
-        with self.lock:
-            if scope == "daily":
-                key = time.strftime("%Y-%m-%d", time.localtime())
-                data = self.days.get(key, {})
-            else:
-                key = time.strftime("%Y-%m", time.localtime())
-                data = self.months.get(key, {})
-            return key, data
-            
-            
-            
-class BlocksRegistry:
-    """
-    ساختار فایل blocks_registry.json:
-    {
-      "v": 1,
-      "items": {
-        "<filter_id>": {
-          "id": "...",
-          "pattern": "instagram.com" | "203.0.113.0/24" | "1.2.3.4",
-          "iface": "eth0" | null,   # null یعنی همه اینترفیس‌ها
-          "proto": "all" | "tcp" | "udp",
-          "port":  null | 443 | ...,
-          "created": 1712345678,
-          "show_page": true|false,
-          "realized": { "v4": [...], "v6": [...] }
-        }
-      }
-    }
-    """
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.lock = threading.Lock()
-        self.obj = {"v": 1, "items": {}}
-        self._last_flush = 0.0
-        self.flush_interval = 2.0
-        self.load()
+    def get_scope (self ,scope ):
+        with self .lock :
+            if scope =="daily":
+                key =time .strftime ("%Y-%m-%d",time .localtime ())
+                data =self .days .get (key ,{})
+            else :
+                key =time .strftime ("%Y-%m",time .localtime ())
+                data =self .months .get (key ,{})
+            return key ,data 
 
-    def load(self):
-        try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                o = json.load(f)
-            if isinstance(o, dict) and "items" in o:
-                self.obj = o
-        except Exception:
-            self.obj = {"v": 1, "items": {}}
+class BlocksRegistry :
+    def __init__ (self ,filepath ):
+        self .filepath =filepath 
+        self .lock =threading .Lock ()
+        self .obj ={"v":1 ,"items":{}}
+        self ._last_flush =0.0 
+        self .flush_interval =2.0 
+        self .load ()
 
-    def flush(self, force=False):
-        now = time.time()
-        if not force and (now - self._last_flush) < self.flush_interval:
-            return
-        with self.lock:
-            data = json.loads(json.dumps(self.obj, ensure_ascii=False))
-        tmp = self.filepath + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.filepath)
-            self._last_flush = now
-        except Exception:
-            pass
+    def load (self ):
+        try :
+            with open (self .filepath ,"r",encoding ="utf-8")as f :
+                o =json .load (f )
+            if isinstance (o ,dict )and "items"in o :
+                self .obj =o 
+        except Exception :
+            self .obj ={"v":1 ,"items":{}}
 
-    def _ensure_item(self, fid):
-        it = self.obj["items"].get(fid)
-        if not it:
-            it = {"id": fid, "pattern": None, "iface": None, "proto": "all",
-                  "port": None, "created": int(time.time()), "show_page": False,
-                  "realized": {"v4": [], "v6": []}}
-            self.obj["items"][fid] = it
-        if "realized" not in it:
-            it["realized"] = {"v4": [], "v6": []}
-        return it
+    def flush (self ,force =False ):
+        now =time .time ()
+        if not force and (now -self ._last_flush )<self .flush_interval :
+            return 
+        with self .lock :
+            data =json .loads (json .dumps (self .obj ,ensure_ascii =False ))
+        tmp =self .filepath +".tmp"
+        try :
+            with open (tmp ,"w",encoding ="utf-8")as f :
+                json .dump (data ,f ,ensure_ascii =False ,indent =2 )
+            os .replace (tmp ,self .filepath )
+            self ._last_flush =now 
+        except Exception :
+            pass 
 
-    def upsert_from_rec(self, rec: dict):
-        if not rec: return
-        fid = rec.get("id")
-        if not fid: return
-        with self.lock:
-            it = self._ensure_item(fid)
-            it["pattern"]   = rec.get("pattern")
-            it["iface"]     = rec.get("iface") or None
-            it["proto"]     = (rec.get("proto") or "all").lower()
-            it["port"]      = rec.get("port")
-            it["show_page"] = bool(rec.get("show_page"))
-            it["created"]   = int(rec.get("created") or it.get("created") or int(time.time()))
-            rv4 = list((rec.get("realized") or {}).get("v4") or [])
-            rv6 = list((rec.get("realized") or {}).get("v6") or [])
-            it["realized"]["v4"] = sorted(set(it["realized"]["v4"]) | set(rv4))
-            it["realized"]["v6"] = sorted(set(it["realized"]["v6"]) | set(rv6))
-        self.flush()
+    def _ensure_item (self ,fid ):
+        it =self .obj ["items"].get (fid )
+        if not it :
+            it ={"id":fid ,"pattern":None ,"iface":None ,"proto":"all",
+            "port":None ,"created":int (time .time ()),"show_page":False ,
+            "realized":{"v4":[],"v6":[]}}
+            self .obj ["items"][fid ]=it 
+        if "realized"not in it :
+            it ["realized"]={"v4":[],"v6":[]}
+        return it 
 
-    def set_realized(self, fid: str, v4: list, v6: list):
-        with self.lock:
-            it = self._ensure_item(fid)
-            it["realized"]["v4"] = sorted(set(v4 or []))
-            it["realized"]["v6"] = sorted(set(v6 or []))
-        self.flush()
+    def upsert_from_rec (self ,rec :dict ):
+        if not rec :return 
+        fid =rec .get ("id")
+        if not fid :return 
+        with self .lock :
+            it =self ._ensure_item (fid )
+            it ["pattern"]=rec .get ("pattern")
+            it ["iface"]=rec .get ("iface")or None 
+            it ["proto"]=(rec .get ("proto")or "all").lower ()
+            it ["port"]=rec .get ("port")
+            it ["show_page"]=bool (rec .get ("show_page"))
+            it ["created"]=int (rec .get ("created")or it .get ("created")or int (time .time ()))
+            rv4 =list ((rec .get ("realized")or {}).get ("v4")or [])
+            rv6 =list ((rec .get ("realized")or {}).get ("v6")or [])
+            it ["realized"]["v4"]=sorted (set (it ["realized"]["v4"])|set (rv4 ))
+            it ["realized"]["v6"]=sorted (set (it ["realized"]["v6"])|set (rv6 ))
+        self .flush ()
 
-    def add_realized_ip(self, fid: str, fam: str, ip: str):
-        if fam not in ("v4","v6") or not ip: return
-        with self.lock:
-            it = self._ensure_item(fid)
-            arr = it["realized"][fam]
-            if ip not in arr:
-                arr.append(ip)
-        self.flush()
+    def set_realized (self ,fid :str ,v4 :list ,v6 :list ):
+        with self .lock :
+            it =self ._ensure_item (fid )
+            it ["realized"]["v4"]=sorted (set (v4 or []))
+            it ["realized"]["v6"]=sorted (set (v6 or []))
+        self .flush ()
 
-    def remove(self, fid: str):
-        with self.lock:
-            self.obj["items"].pop(fid, None)
-        self.flush()
+    def add_realized_ip (self ,fid :str ,fam :str ,ip :str ):
+        if fam not in ("v4","v6")or not ip :return 
+        with self .lock :
+            it =self ._ensure_item (fid )
+            arr =it ["realized"][fam ]
+            if ip not in arr :
+                arr .append (ip )
+        self .flush ()
 
-            
+    def remove (self ,fid :str ):
+        with self .lock :
+            self .obj ["items"].pop (fid ,None )
+        self .flush ()
 
-periods = PeriodStore(PERIOD_FILE)
-blocksreg = BlocksRegistry(BLOCKS_REG_FILE)
+periods =PeriodStore (PERIOD_FILE )
+blocksreg =BlocksRegistry (BLOCKS_REG_FILE )
 
+def _sync_registry_for (fid :str ):
 
-def _sync_registry_for(fid: str):
+    if not fid :
+        return 
+    with filters .lock :
+        rec =filters .items .get (fid )
+    if not rec :
+        return 
 
-    """همگام‌سازی رجیستری برای یک آیتم بر اساس همان دیتایی که ستون Resolved از آن استفاده می‌کند."""
-    if not fid:
-        return
-    with filters.lock:
-        rec = filters.items.get(fid)
-    if not rec:
-        return
+    rv4 =list (((rec .get ("realized")or {}).get ("v4")or []))
+    rv6 =list (((rec .get ("realized")or {}).get ("v6")or []))
 
-    # از همون realized که UI استفاده می‌کنه بخون
-    rv4 = list(((rec.get("realized") or {}).get("v4") or []))
-    rv6 = list(((rec.get("realized") or {}).get("v6") or []))
+    pat =(rec .get ("pattern")or "").strip ()
+    if pat and _split_family (pat )is None :
+        base =_registrable_domain (pat )or _normalize_domain_or_none (pat )or pat .strip ().lower ().strip (".")
+        v4i ,v6i =sni_index .get_ips_for_base (base )
+        rv4 =sorted (set (rv4 )|set (v4i or []))
+        rv6 =sorted (set (rv6 )|set (v6i or []))
 
-    # اگر دامنه است، IPهای sni_index را هم ادغام کن تا کامل‌تر شود
-    pat = (rec.get("pattern") or "").strip()
-    if pat and _split_family(pat) is None:
-        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
-        v4i, v6i = sni_index.get_ips_for_base(base)
-        rv4 = sorted(set(rv4) | set(v4i or []))
-        rv6 = sorted(set(rv6) | set(v6i or []))
+    try :
+        blocksreg .upsert_from_rec (rec )
+    except Exception :
+        pass 
+    blocksreg .set_realized (fid ,rv4 ,rv6 )
 
-    # اول خود رکورد را بالا ببر داخل رجیستری، بعد realized را ست کن
-    try:
-        blocksreg.upsert_from_rec(rec)
-    except Exception:
-        pass
-    blocksreg.set_realized(fid, rv4, rv6)
+def _start_registry_autosync (interval =5.0 ):
+    def loop ():
+        while True :
+            try :
+                with filters .lock :
+                    ids =[it .get ("id")for it in (filters .items or {}).values ()if it and it .get ("id")]
+                for fid in ids :
+                    _sync_registry_for (fid )
+            except Exception as e :
+                print ("[netdash] autosync warn:",e )
+            time .sleep (interval )
+    threading .Thread (target =loop ,daemon =True ).start ()
 
+class NetMonitor :
+    def __init__ (self ,poll_interval =1.0 ):
+        self .poll =poll_interval 
+        self .prev ={}
+        self .data ={}
+        self .lock =threading .Lock ()
+        self .running =False 
 
-def _start_registry_autosync(interval=5.0):
-    def loop():
-        while True:
-            try:
-                with filters.lock:
-                    ids = [it.get("id") for it in (filters.items or {}).values() if it and it.get("id")]
-                for fid in ids:
-                    _sync_registry_for(fid)
-            except Exception as e:
-                print("[netdash] autosync warn:", e)
-            time.sleep(interval)
-    threading.Thread(target=loop, daemon=True).start()
+    def _loop (self ):
+        while self .running :
+            now =time .time ()
+            ifaces =list_ifaces_fs ()
+            with self .lock :
+                for iface in ifaces :
+                    rx ,tx =read_counters (iface )
+                    old =self .prev .get (iface )
+                    if old :
+                        rx0 ,tx0 ,t0 =old 
+                        dt =max (1e-6 ,now -t0 )
+                        rx_bps =max (0.0 ,(rx -rx0 )/dt )
+                        tx_bps =max (0.0 ,(tx -tx0 )/dt )
+                        delta_rx =(rx -rx0 )if rx >=rx0 else rx 
+                        delta_tx =(tx -tx0 )if tx >=tx0 else tx 
+                    else :
+                        rx_bps =tx_bps =0.0 
+                        delta_rx =delta_tx =0 
+                    self .prev [iface ]=(rx ,tx ,now )
 
+                    rx_total ,tx_total =totals .update (iface ,rx ,tx )
 
-
-
-# ------------------ Monitor ------------------
-class NetMonitor:
-    def __init__(self, poll_interval=1.0):
-        self.poll = poll_interval
-        self.prev = {}
-        self.data = {}
-        self.lock = threading.Lock()
-        self.running = False
-
-    def _loop(self):
-        while self.running:
-            now = time.time()
-            ifaces = list_ifaces_fs()
-            with self.lock:
-                for iface in ifaces:
-                    rx, tx = read_counters(iface)
-                    old = self.prev.get(iface)
-                    if old:
-                        rx0, tx0, t0 = old
-                        dt = max(1e-6, now - t0)
-                        rx_bps = max(0.0, (rx - rx0) / dt)
-                        tx_bps = max(0.0, (tx - tx0) / dt)
-                        delta_rx = (rx - rx0) if rx >= rx0 else rx
-                        delta_tx = (tx - tx0) if tx >= tx0 else tx
-                    else:
-                        rx_bps = tx_bps = 0.0
-                        delta_rx = delta_tx = 0
-                    self.prev[iface] = (rx, tx, now)
-
-                    rx_total, tx_total = totals.update(iface, rx, tx)
-
-                    self.data[iface] = {
-                        "rx_bps": rx_bps, "tx_bps": tx_bps,
-                        "rx_bytes": rx, "tx_bytes": tx,
-                        "rx_total": rx_total, "tx_total": tx_total,
-                        "ts": now
+                    self .data [iface ]={
+                    "rx_bps":rx_bps ,"tx_bps":tx_bps ,
+                    "rx_bytes":rx ,"tx_bytes":tx ,
+                    "rx_total":rx_total ,"tx_total":tx_total ,
+                    "ts":now 
                     }
-                    history.add(iface, now, rx_bps, tx_bps)
-                    periods.update(iface, delta_rx, delta_tx, now)
-            history.flush()
-            totals.flush()
-            periods.flush()
-            time.sleep(self.poll)
+                    history .add (iface ,now ,rx_bps ,tx_bps )
+                    periods .update (iface ,delta_rx ,delta_tx ,now )
+            history .flush ()
+            totals .flush ()
+            periods .flush ()
+            time .sleep (self .poll )
 
-    def start(self):
-        if self.running:
-            return
-        self.running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+    def start (self ):
+        if self .running :
+            return 
+        self .running =True 
+        threading .Thread (target =self ._loop ,daemon =True ).start ()
 
-    def snapshot(self):
-        with self.lock:
-            return {"ts": time.time(), "rates": dict(self.data)}
+    def snapshot (self ):
+        with self .lock :
+            return {"ts":time .time (),"rates":dict (self .data )}
 
-monitor = NetMonitor(POLL_INTERVAL)
+monitor =NetMonitor (POLL_INTERVAL )
 
-
-
-
-
-# ------------------ Controls ------------------
-def _find_ip_binary():
-    for p in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "ip"):
-        if os.path.isabs(p) and os.path.exists(p):
-            return p
+def _find_ip_binary ():
+    for p in ("/usr/sbin/ip","/sbin/ip","/usr/bin/ip","ip"):
+        if os .path .isabs (p )and os .path .exists (p ):
+            return p 
     return "ip"
 
-def _require_token():
-    if CONTROL_TOKEN:
-        tok = request.headers.get("X-Auth-Token", "")
-        if tok != CONTROL_TOKEN:
-            abort(401, description="Invalid token")
+def _require_token ():
+    if CONTROL_TOKEN :
+        tok =request .headers .get ("X-Auth-Token","")
+        if tok !=CONTROL_TOKEN :
+            abort (401 ,description ="Invalid token")
 
-def iface_action(iface: str, action: str):
-    if not can_control(iface):
-        abort(403, description="Interface not permitted")
-    _require_token()
-    ipbin = _find_ip_binary()
-    cmd = [ipbin, "link", "set", "dev", iface, "down" if action == "down" else "up"]
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
-    try:
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.2)
-        return {"ok": True, "iface": iface, "action": action}
-    except subprocess.CalledProcessError as e:
-        return {"ok": False, "error": f"ip failed ({e})", "iface": iface, "action": action}, 500
+def iface_action (iface :str ,action :str ):
+    if not can_control (iface ):
+        abort (403 ,description ="Interface not permitted")
+    _require_token ()
+    ipbin =_find_ip_binary ()
+    cmd =[ipbin ,"link","set","dev",iface ,"down"if action =="down"else "up"]
+    if os .geteuid ()!=0 :
+        cmd =["sudo","-n"]+cmd 
+    try :
+        subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+        time .sleep (0.2 )
+        return {"ok":True ,"iface":iface ,"action":action }
+    except subprocess .CalledProcessError as e :
+        return {"ok":False ,"error":f"ip failed ({e})","iface":iface ,"action":action },500 
 
+class PingMonitor :
+    def __init__ (self ,targets =None ,interval =5.0 ,window =50 ,timeout =1.2 ):
+        if targets is None :
+            env =os .environ .get ("NETDASH_PING_TARGETS","1.1.1.1,8.8.8.8,9.9.9.9")
+            targets =[t .strip ()for t in env .split (",")if t .strip ()]
+        self .targets =targets 
+        self .interval =float (os .environ .get ("NETDASH_PING_INTERVAL",str (interval )))
+        self .window =int (os .environ .get ("NETDASH_PING_WINDOW",str (window )))
+        self .timeout =timeout 
+        self .stats ={t :{"rtt":deque (maxlen =self .window ),"sent":0 ,"recv":0 ,"last":None }for t in self .targets }
+        self .lock =threading .Lock ()
+        self .running =False 
 
-# ------------------ Ping Monitor ------------------
-class PingMonitor:
-    def __init__(self, targets=None, interval=5.0, window=50, timeout=1.2):
-        if targets is None:
-            env = os.environ.get("NETDASH_PING_TARGETS", "1.1.1.1,8.8.8.8,9.9.9.9")
-            targets = [t.strip() for t in env.split(",") if t.strip()]
-        self.targets = targets
-        self.interval = float(os.environ.get("NETDASH_PING_INTERVAL", str(interval)))
-        self.window = int(os.environ.get("NETDASH_PING_WINDOW", str(window)))
-        self.timeout = timeout
-        self.stats = {t: {"rtt": deque(maxlen=self.window), "sent": 0, "recv": 0, "last": None} for t in self.targets}
-        self.lock = threading.Lock()
-        self.running = False
+    def _ping_once (self ,target ):
 
-    def _ping_once(self, target):
-        # تلاش با iputils (-w)، در صورت خطا/عدم پشتیبانی، busybox (-W)
         for cmd in (
-            ["ping", "-n", "-c", "1", "-w", "1", target],  # iputils
-            ["ping", "-n", "-c", "1", "-W", "1", target],  # busybox
+        ["ping","-n","-c","1","-w","1",target ],
+        ["ping","-n","-c","1","-W","1",target ],
         ):
-            try:
-                out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=self.timeout)
-            except subprocess.CalledProcessError as e:
-                out = e.output or ""
-            except subprocess.TimeoutExpired:
-                return None
-    
-            m = re.search(r"time[=<]\s*([0-9.]+)\s*ms", out)
-            if m:
-                return float(m.group(1))
-        return None
+            try :
+                out =subprocess .check_output (cmd ,stderr =subprocess .STDOUT ,text =True ,timeout =self .timeout )
+            except subprocess .CalledProcessError as e :
+                out =e .output or ""
+            except subprocess .TimeoutExpired :
+                return None 
 
+            m =re .search (r"time[=<]\s*([0-9.]+)\s*ms",out )
+            if m :
+                return float (m .group (1 ))
+        return None 
 
-    def _loop(self):
-        while self.running:
-            with self.lock:
-                targets = list(self.targets)
-            for t in targets:
-                rtt = self._ping_once(t)
-                with self.lock:
-                    st = self.stats[t]
-                    st["sent"] += 1
-                    st["last"] = time.time()
-                    if rtt is not None:
-                        st["recv"] += 1
-                        st["rtt"].append(float(rtt))
-            time.sleep(self.interval)
+    def _loop (self ):
+        while self .running :
+            with self .lock :
+                targets =list (self .targets )
+            for t in targets :
+                rtt =self ._ping_once (t )
+                with self .lock :
+                    st =self .stats [t ]
+                    st ["sent"]+=1 
+                    st ["last"]=time .time ()
+                    if rtt is not None :
+                        st ["recv"]+=1 
+                        st ["rtt"].append (float (rtt ))
+            time .sleep (self .interval )
 
-    def start(self):
-        if self.running: return
-        self.running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+    def start (self ):
+        if self .running :return 
+        self .running =True 
+        threading .Thread (target =self ._loop ,daemon =True ).start ()
 
-    def snapshot(self):
-        out = {}
-        with self.lock:
-            for t, st in self.stats.items():
-                arr = list(st["rtt"])
-                avg = sum(arr)/len(arr) if arr else 0.0
-                p95 = sorted(arr)[int(0.95*(len(arr)-1))] if arr else 0.0
-                mx = max(arr) if arr else 0.0
-                loss = 0.0
-                if st["sent"] > 0:
-                    loss = max(0.0, 100.0 * (1.0 - (st["recv"]/st["sent"])))
-                out[t] = {"avg": avg, "p95": p95, "max": mx, "loss": loss, "n": len(arr)}
-        return out
+    def snapshot (self ):
+        out ={}
+        with self .lock :
+            for t ,st in self .stats .items ():
+                arr =list (st ["rtt"])
+                avg =sum (arr )/len (arr )if arr else 0.0 
+                p95 =sorted (arr )[int (0.95 *(len (arr )-1 ))]if arr else 0.0 
+                mx =max (arr )if arr else 0.0 
+                loss =0.0 
+                if st ["sent"]>0 :
+                    loss =max (0.0 ,100.0 *(1.0 -(st ["recv"]/st ["sent"])))
+                out [t ]={"avg":avg ,"p95":p95 ,"max":mx ,"loss":loss ,"n":len (arr )}
+        return out 
 
-pingmon = PingMonitor()
-pingmon.start()
+pingmon =PingMonitor ()
+pingmon .start ()
 
+def _run_root (cmd ):
+    c =cmd [:]
+    if os .geteuid ()!=0 :
+        c =["sudo","-n"]+c 
+    try :
+        subprocess .check_call (c ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+        return 0 
+    except subprocess .CalledProcessError :
+        return 1 
 
+def _ipt_ensure (args ,table =None ,v6 =False ):
+    base =["ip6tables"]if v6 else ["iptables"]
+    if table :
+        base +=["-t",table ]
+    check =base +["-C"]+args 
+    insert =base +["-I"]+args 
+    if _run_root (check )!=0 :
+        _run_root (insert )
 
-# ------------------ Traffic Shaping (tc) ------------------
-
-# ------------------ Address Filters (iptables) ------------------
-
-
-def _run_root(cmd):
-    c = cmd[:]
-    if os.geteuid() != 0:
-        c = ["sudo", "-n"] + c
-    try:
-        subprocess.check_call(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return 0
-    except subprocess.CalledProcessError:
-        return 1
-        
-  
-        
-
-def _ipt_ensure(args, table=None, v6=False):
-    base = ["ip6tables"] if v6 else ["iptables"]
-    if table:
-        base += ["-t", table]
-    check = base + ["-C"] + args
-    insert = base + ["-I"] + args
-    if _run_root(check) != 0:
-        _run_root(insert)
-
-
-# --- per-iface ipset helpers ---
-def _iface_suffix(iface: str | None) -> str:
-    if not iface:
+def _iface_suffix (iface :str |None )->str :
+    if not iface :
         return ""
-    s = re.sub(r'[^a-zA-Z0-9_.-]+', '-', str(iface))
-    return "__" + s
+    s =re .sub (r'[^a-zA-Z0-9_.-]+','-',str (iface ))
+    return "__"+s 
 
-def _ipset_names_for(obj, show_page: bool | None = None):
-    """
-    obj: یا dict رکورد فیلتر است یا نام اینترفیس.
-    اگر show_page=None و obj دیکشنری بود، از rec['show_page'] استفاده می‌شود.
-    """
-    if isinstance(obj, dict):
-        iface = obj.get("iface") or None
-        sp = obj.get("show_page", False) if show_page is None else bool(show_page)
-    else:
-        iface = obj or None
-        sp = bool(show_page)
-    sfx = _iface_suffix(iface)
-    if sp and PAGE_MODE_ENABLED:
-        return f"{IPSET4P}{sfx}", f"{IPSET6P}{sfx}"
-    return f"{IPSET4}{sfx}", f"{IPSET6}{sfx}"
-    
+def _ipset_names_for (obj ,show_page :bool |None =None ):
+    if isinstance (obj ,dict ):
+        iface =obj .get ("iface")or None 
+        sp =obj .get ("show_page",False )if show_page is None else bool (show_page )
+    else :
+        iface =obj or None 
+        sp =bool (show_page )
+    sfx =_iface_suffix (iface )
+    if sp and PAGE_MODE_ENABLED :
+        return f"{IPSET4P}{sfx}",f"{IPSET6P}{sfx}"
+    return f"{IPSET4}{sfx}",f"{IPSET6}{sfx}"
 
-def ensure_ipset_and_rules_for_iface(iface: str, show_page: bool):
-    """ipsetهای مخصوص iface را بساز و قوانین DROP/NAT per-iface را تضمین کن."""
-    set4, set6 = _ipset_names_for(iface, show_page)
-    _run_root(["ipset","create", set4,"hash:net","family","inet","timeout",str(IPSET_TIMEOUT),"-exist"])
-    _run_root(["ipset","create", set6,"hash:net","family","inet6","timeout",str(IPSET_TIMEOUT),"-exist"])
+def ensure_ipset_and_rules_for_iface (iface :str ,show_page :bool ):
+    set4 ,set6 =_ipset_names_for (iface ,show_page )
+    _run_root (["ipset","create",set4 ,"hash:net","family","inet","timeout",str (IPSET_TIMEOUT ),"-exist"])
+    _run_root (["ipset","create",set6 ,"hash:net","family","inet6","timeout",str (IPSET_TIMEOUT ),"-exist"])
 
-    # DROP فقط روی خروجی همان اینترفیس
-    _ipt_ensure(["FORWARD","-o",iface,"-m","set","--match-set",set4,"dst","-j","DROP"])
-    _ipt_ensure(["OUTPUT","-o",iface,"-m","set","--match-set",set4,"dst","-j","DROP"])
-    _ipt_ensure(["FORWARD","-o",iface,"-m","set","--match-set",set6,"dst","-j","DROP"], v6=True)
-    _ipt_ensure(["OUTPUT","-o",iface,"-m","set","--match-set",set6,"dst","-j","DROP"], v6=True)
+    _ipt_ensure (["FORWARD","-o",iface ,"-m","set","--match-set",set4 ,"dst","-j","DROP"])
+    _ipt_ensure (["OUTPUT","-o",iface ,"-m","set","--match-set",set4 ,"dst","-j","DROP"])
+    _ipt_ensure (["FORWARD","-o",iface ,"-m","set","--match-set",set6 ,"dst","-j","DROP"],v6 =True )
+    _ipt_ensure (["OUTPUT","-o",iface ,"-m","set","--match-set",set6 ,"dst","-j","DROP"],v6 =True )
 
-    # اختیاری: ریدایرکت صفحهٔ مسدودسازی برای HTTP لوکال روی همان iface
-    if PAGE_MODE_ENABLED and show_page:
-        _ipt_ensure(["OUTPUT","-p","tcp","-o",iface,"-m","set","--match-set", set4,
-                     "dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat")
-        _ipt_ensure(["OUTPUT","-p","tcp","-o",iface,"-m","set","--match-set", set6,
-                     "dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat", v6=True)
+    if PAGE_MODE_ENABLED and show_page :
+        _ipt_ensure (["OUTPUT","-p","tcp","-o",iface ,"-m","set","--match-set",set4 ,
+        "dst","--dport","80","-j","REDIRECT","--to-ports",str (BLOCK_PORT )],table ="nat")
+        _ipt_ensure (["OUTPUT","-p","tcp","-o",iface ,"-m","set","--match-set",set6 ,
+        "dst","--dport","80","-j","REDIRECT","--to-ports",str (BLOCK_PORT )],table ="nat",v6 =True )
 
+def ensure_ipset_and_rules ():
 
+    _run_root (["ipset","create",IPSET4 ,"hash:net","family","inet","timeout",str (IPSET_TIMEOUT ),"-exist"])
+    _run_root (["ipset","create",IPSET6 ,"hash:net","family","inet6","timeout",str (IPSET_TIMEOUT ),"-exist"])
+    _run_root (["ipset","create",IPSET4P ,"hash:net","family","inet","timeout",str (IPSET_TIMEOUT ),"-exist"])
+    _run_root (["ipset","create",IPSET6P ,"hash:net","family","inet6","timeout",str (IPSET_TIMEOUT ),"-exist"])
 
+    _ipt_ensure (["FORWARD","-m","set","--match-set",IPSET4 ,"dst","-j","DROP"])
+    _ipt_ensure (["OUTPUT","-m","set","--match-set",IPSET4 ,"dst","-j","DROP"])
+    _ipt_ensure (["FORWARD","-m","set","--match-set",IPSET6 ,"dst","-j","DROP"],v6 =True )
+    _ipt_ensure (["OUTPUT","-m","set","--match-set",IPSET6 ,"dst","-j","DROP"],v6 =True )
 
-
-
-def ensure_ipset_and_rules():
-    # 1) بساز/مطمئن شو ipsetها هستند
-    _run_root(["ipset","create",IPSET4,"hash:net","family","inet","timeout",str(IPSET_TIMEOUT),"-exist"])
-    _run_root(["ipset","create",IPSET6,"hash:net","family","inet6","timeout",str(IPSET_TIMEOUT),"-exist"])
-    _run_root(["ipset","create",IPSET4P,"hash:net","family","inet","timeout",str(IPSET_TIMEOUT),"-exist"])
-    _run_root(["ipset","create",IPSET6P,"hash:net","family","inet6","timeout",str(IPSET_TIMEOUT),"-exist"])
-
-    # 2) قواعد DROP/REDIRECT
-    _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET4,"dst","-j","DROP"])
-    _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET4,"dst","-j","DROP"])
-    _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET6,"dst","-j","DROP"], v6=True)
-    _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET6,"dst","-j","DROP"], v6=True)
-
-    if PAGE_MODE_ENABLED:
+    if PAGE_MODE_ENABLED :
         for ch in ("OUTPUT","PREROUTING"):
-            _ipt_ensure([ch,"-p","tcp","-m","set","--match-set",IPSET4P,"dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat")
-            _ipt_ensure([ch,"-p","tcp","-m","set","--match-set",IPSET6P,"dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat", v6=True)
-    else:
-        _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET4P,"dst","-j","DROP"])
-        _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET4P,"dst","-j","DROP"])
-        _ipt_ensure(["FORWARD","-m","set","--match-set",IPSET6P,"dst","-j","DROP"], v6=True)
-        _ipt_ensure(["OUTPUT","-m","set","--match-set",IPSET6P,"dst","-j","DROP"], v6=True)
+            _ipt_ensure ([ch ,"-p","tcp","-m","set","--match-set",IPSET4P ,"dst","--dport","80","-j","REDIRECT","--to-ports",str (BLOCK_PORT )],table ="nat")
+            _ipt_ensure ([ch ,"-p","tcp","-m","set","--match-set",IPSET6P ,"dst","--dport","80","-j","REDIRECT","--to-ports",str (BLOCK_PORT )],table ="nat",v6 =True )
+    else :
+        _ipt_ensure (["FORWARD","-m","set","--match-set",IPSET4P ,"dst","-j","DROP"])
+        _ipt_ensure (["OUTPUT","-m","set","--match-set",IPSET4P ,"dst","-j","DROP"])
+        _ipt_ensure (["FORWARD","-m","set","--match-set",IPSET6P ,"dst","-j","DROP"],v6 =True )
+        _ipt_ensure (["OUTPUT","-m","set","--match-set",IPSET6P ,"dst","-j","DROP"],v6 =True )
 
+def _dnsmasq_hup ():
 
+    if _run_root (["pkill","-HUP","dnsmasq"])!=0 :
+        _run_root (["systemctl","reload","dnsmasq"])
 
-def _dnsmasq_hup():
-    # اول pkill -HUP؛ اگر نبود، systemctl reload
-    if _run_root(["pkill","-HUP","dnsmasq"]) != 0:
-        _run_root(["systemctl","reload","dnsmasq"])
+def _is_private_ipv4_cidr (cidr ):
+    try :
+        net =ipaddress .ip_network (cidr ,strict =False )
+        return net .version ==4 and (net .is_private or str (net ).startswith ("100.64."))
+    except Exception :
+        return False 
 
+def _lan_ifaces_guess ():
+    lans =[]
+    try :
+        for it in get_interfaces_info ():
+            if not it .get ("is_up"):
+                continue 
+            n =it .get ("name","")
+            if n .startswith ("lo"):
+                continue 
+            addrs =it .get ("addresses")or []
+            if any (_is_private_ipv4_cidr (a .get ("cidr",""))for a in addrs ):
+                lans .append (n )
+    except Exception :
+        pass 
+    return lans 
 
-# --- Helper: تشخیص اینترفیس‌های LAN با IPv4 خصوصی ---
-def _is_private_ipv4_cidr(cidr):
-    try:
-        net = ipaddress.ip_network(cidr, strict=False)
-        return net.version == 4 and (net.is_private or str(net).startswith("100.64."))
-    except Exception:
-        return False
+def _ensure_dns_redirection ():
 
-def _lan_ifaces_guess():
-    lans = []
-    try:
-        for it in get_interfaces_info():
-            if not it.get("is_up"): 
-                continue
-            n = it.get("name","")
-            if n.startswith("lo"): 
-                continue
-            addrs = it.get("addresses") or []
-            if any(_is_private_ipv4_cidr(a.get("cidr","")) for a in addrs):
-                lans.append(n)
-    except Exception:
-        pass
-    return lans
+    for lan in _lan_ifaces_guess ():
+        for proto in ("udp","tcp"):
 
-# --- ENFORCE DNS: همهٔ درخواست‌های 53 به dnsmasq لوکال برود ---
-def _ensure_dns_redirection():
-    # فقط ترافیک کلاینت‌های LAN را بگیر (PREROUTING)، نه خروجی خود میزبان
-    for lan in _lan_ifaces_guess():
-        for proto in ("udp", "tcp"):
-            # IPv4
-            _ipt_ensure(
-                ["PREROUTING", "-i", lan, "-p", proto, "--dport", "53",
-                 "-j", "REDIRECT", "--to-ports", "53"],
-                table="nat"
-            )
-            # IPv6
-            _ipt_ensure(
-                ["PREROUTING", "-i", lan, "-p", proto, "--dport", "53",
-                 "-j", "REDIRECT", "--to-ports", "53"],
-                table="nat",
-                v6=True
+            _ipt_ensure (
+            ["PREROUTING","-i",lan ,"-p",proto ,"--dport","53",
+            "-j","REDIRECT","--to-ports","53"],
+            table ="nat"
             )
 
+            _ipt_ensure (
+            ["PREROUTING","-i",lan ,"-p",proto ,"--dport","53",
+            "-j","REDIRECT","--to-ports","53"],
+            table ="nat",
+            v6 =True 
+            )
 
-# --- BLOCK DoT (TCP/853) هم برای خروجی خود میزبان هم عبوری روتر ---
-def _ensure_block_dot():
-    for v6 in (False, True):
+def _ensure_block_dot ():
+    for v6 in (False ,True ):
         for ch in ("OUTPUT","FORWARD"):
-            _ipt_ensure([ch,"-p","tcp","--dport","853","-j","REJECT"], v6=v6)
+            _ipt_ensure ([ch ,"-p","tcp","--dport","853","-j","REJECT"],v6 =v6 )
 
-# --- لیست آماده: دامنه‌های متا و چند ارائه‌دهندهٔ DoH ---
-DEFAULT_BLOCKS = [
-    # Meta
-    "instagram.com","cdninstagram.com","facebook.com","facebook.net","fbcdn.net",
-    "whatsapp.com","whatsapp.net",
-    # DoH providers (نمونه‌های متداول)
-    "dns.google","cloudflare-dns.com","one.one.one.one","quad9.net","dns.quad9.net",
-    "adguard-dns.com","nextdns.io","dns.nextdns.io","dns.sb","doh.opendns.com"
+DEFAULT_BLOCKS =[
+
+"instagram.com","cdninstagram.com","facebook.com","facebook.net","fbcdn.net",
+"whatsapp.com","whatsapp.net",
+
+"dns.google","cloudflare-dns.com","one.one.one.one","quad9.net","dns.quad9.net",
+"adguard-dns.com","nextdns.io","dns.nextdns.io","dns.sb","doh.opendns.com"
 ]
 
-def _preload_blocklist():
-    existing = set()
-    with filters.lock:
-        existing = { (it or {}).get("pattern","").strip().lower() for it in (filters.items or {}).values() }
-    for dom in DEFAULT_BLOCKS:
-        if dom not in existing:
-            try:
-                # show_page=False: سِروِر را drop می‌کنیم (HTTPS). SNI هم auto اضافه می‌شود.
-                filters.add(dom, show_page=False)
-            except Exception as e:
-                print("[netdash] preload add failed:", dom, e)
+def _preload_blocklist ():
+    existing =set ()
+    with filters .lock :
+        existing ={(it or {}).get ("pattern","").strip ().lower ()for it in (filters .items or {}).values ()}
+    for dom in DEFAULT_BLOCKS :
+        if dom not in existing :
+            try :
 
+                filters .add (dom ,show_page =False )
+            except Exception as e :
+                print ("[netdash] preload add failed:",dom ,e )
 
+def _prime_dnsmasq_for_items (items_dict ):
+    domains =set ()
+    for it in items_dict .values ():
+        if (it or {}).get ("iface"):
+            continue 
+        pat =(it or {}).get ("pattern","").strip ()
+        if pat and _split_family (pat )is None :
+            domains .add (pat )
 
-# ������������ اینجا بچسبان
-def _prime_dnsmasq_for_items(items_dict):
-    domains = set()
-    for it in items_dict.values():
-        if (it or {}).get("iface"):   # ⬅️ per-interface را رها کن
-            continue
-        pat = (it or {}).get("pattern","").strip()
-        if pat and _split_family(pat) is None:
-            domains.add(pat)
-
-    def _prime_one(dom, qtype):
-        cmds = [
-            ["dig", "+short", qtype, dom, "@127.0.0.1"],
-            ["drill", "-Q", dom, qtype, "@127.0.0.1"],
-            ["host", "-t", qtype, dom, "127.0.0.1"],
+    def _prime_one (dom ,qtype ):
+        cmds =[
+        ["dig","+short",qtype ,dom ,"@127.0.0.1"],
+        ["drill","-Q",dom ,qtype ,"@127.0.0.1"],
+        ["host","-t",qtype ,dom ,"127.0.0.1"],
         ]
-        for cmd in cmds:
-            try:
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-                return
-            except Exception:
-                continue
+        for cmd in cmds :
+            try :
+                subprocess .run (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL ,timeout =2 )
+                return 
+            except Exception :
+                continue 
 
-    time.sleep(0.1)  # بعد از HUP
-    for d in domains:
-        _prime_one(d, "A")
-        _prime_one(d, "AAAA")
+    time .sleep (0.1 )
+    for d in domains :
+        _prime_one (d ,"A")
+        _prime_one (d ,"AAAA")
 
+def _rebuild_dnsmasq_conf_from_items (items_dict ):
+    lines =[]
+    for it in items_dict .values ():
+        pat =(it or {}).get ("pattern","").strip ()
 
+        if (it or {}).get ("iface"):
+            continue 
 
+        fam =_split_family (pat )
+        if fam is None and pat :
+            dom =_normalize_domain_or_none (pat )
+            if not dom :
+                continue 
+            variants =_domain_variants (dom )
+            if PAGE_MODE_ENABLED and it .get ("show_page"):
+                for v in variants :
+                    lines .append (f"ipset=/{v}/{IPSET4P}")
+                    lines .append (f"ipset=/{v}/{IPSET6P}")
+            else :
+                for v in variants :
+                    lines .append (f"ipset=/{v}/{IPSET4}")
+                    lines .append (f"ipset=/{v}/{IPSET6}")
 
-def _rebuild_dnsmasq_conf_from_items(items_dict):
-    lines = []
-    for it in items_dict.values():
-        pat = (it or {}).get("pattern","").strip()
+    content ="# netdash dynamic blocklist\n"+"\n".join (lines )+("\n"if lines else "")
+    try :
+        os .makedirs (os .path .dirname (DNSMASQ_CONF ),exist_ok =True )
+    except Exception :
+        pass 
+    try :
+        tmp =DNSMASQ_CONF +".tmp"
+        with open (tmp ,"w",encoding ="utf-8")as f :
+            f .write (content )
+        os .replace (tmp ,DNSMASQ_CONF )
+    except Exception as e :
+        print ("[netdash] dnsmasq conf write failed:",e )
+        return 
 
-        # آیتم‌های per-interface وارد dnsmasq نشوند تا global نشوند
-        if (it or {}).get("iface"):
-            continue
+    _dnsmasq_hup ()
+    _prime_dnsmasq_for_items (items_dict )
 
-        fam = _split_family(pat)
-        if fam is None and pat:  # domain
-            dom = _normalize_domain_or_none(pat)
-            if not dom:
-                continue
-            variants = _domain_variants(dom)
-            if PAGE_MODE_ENABLED and it.get("show_page"):
-                for v in variants:
-                    lines.append(f"ipset=/{v}/{IPSET4P}")
-                    lines.append(f"ipset=/{v}/{IPSET6P}")
-            else:
-                for v in variants:
-                    lines.append(f"ipset=/{v}/{IPSET4}")
-                    lines.append(f"ipset=/{v}/{IPSET6}")
+def _preseed_ipset_from_index (domain :str ,show_page :bool ):
+    base =_registrable_domain (domain )or _normalize_domain_or_none (domain )or domain .strip ().lower ().strip (".")
+    if not base :
+        return 
+    v4 ,v6 =sni_index .get_ips_for_base (base )
+    set4 =IPSET4P if (show_page and PAGE_MODE_ENABLED )else IPSET4 
+    set6 =IPSET6P if (show_page and PAGE_MODE_ENABLED )else IPSET6 
+    for ip in v4 :
+        _run_root (["ipset","add",set4 ,ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+        print (f"[netdash] preseed: {ip} -> {set4} (base={base})")
+    for ip in v6 :
+        _run_root (["ipset","add",set6 ,ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+        print (f"[netdash] preseed: {ip} -> {set6} (base={base})")
 
-    content = "# netdash dynamic blocklist\n" + "\n".join(lines) + ("\n" if lines else "")
-    try:
-        os.makedirs(os.path.dirname(DNSMASQ_CONF), exist_ok=True)
-    except Exception:
-        pass
-    try:
-        tmp = DNSMASQ_CONF + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(tmp, DNSMASQ_CONF)
-    except Exception as e:
-        print("[netdash] dnsmasq conf write failed:", e)
-        return
+def _preseed_ipset_from_index_for (rec :dict ):
+    pat =(rec or {}).get ("pattern","").strip ()
+    iface =(rec or {}).get ("iface")or None 
+    if not pat or not iface :return 
+    base =_registrable_domain (pat )or _normalize_domain_or_none (pat )or pat .strip ().lower ().strip (".")
+    if not base :return 
+    set4 ,set6 =_ipset_names_for (rec )
+    ensure_ipset_and_rules_for_iface (iface ,bool (rec .get ("show_page")))
+    v4 ,v6 =sni_index .get_ips_for_base (base )
+    for ip in v4 :_run_root (["ipset","add",set4 ,ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+    for ip in v6 :_run_root (["ipset","add",set6 ,ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
 
-    _dnsmasq_hup()
-    _prime_dnsmasq_for_items(items_dict)
+def _hostname_matches (host :str ,base :str )->bool :
+    try :
+        host =(host or "").strip ().lower ().strip (".")
+        base =_normalize_domain_or_none (base )or (base or "").strip ().lower ()
+        if not host or not base :
+            return False 
+        return host ==base or host .endswith ("."+base )
+    except Exception :
+        return False 
 
+def _extract_sni_from_clienthello (data :bytes ):
+    try :
+        if not data or len (data )<5 :
+            return None 
 
+        if data [0 ]!=22 :
+            return None 
+        p =5 
+        if len (data )<p +4 or data [p ]!=1 :
+            return None 
+        hs_len =int .from_bytes (data [p +1 :p +4 ],"big")
+        p +=4 
+        if len (data )<p +hs_len :
+            return None 
 
+        p +=2 +32 
+        if len (data )<p +1 :return None 
+        sid_len =data [p ];p +=1 +sid_len 
+        if len (data )<p +2 :return None 
+        cs_len =int .from_bytes (data [p :p +2 ],"big");p +=2 +cs_len 
+        if len (data )<p +1 :return None 
+        cm_len =data [p ];p +=1 +cm_len 
+        if len (data )<p +2 :return None 
+        ext_len =int .from_bytes (data [p :p +2 ],"big");p +=2 
+        end =min (len (data ),p +ext_len )
+        while p +4 <=end :
+            etype =int .from_bytes (data [p :p +2 ],"big");p +=2 
+            elen =int .from_bytes (data [p :p +2 ],"big");p +=2 
+            if etype ==0 :
+                if p +2 >len (data ):return None 
+                list_len =int .from_bytes (data [p :p +2 ],"big");p +=2 
+                q =p 
+                while q +3 <=len (data )and q <p +list_len :
+                    nt =data [q ];q +=1 
+                    nl =int .from_bytes (data [q :q +2 ],"big");q +=2 
+                    if nt ==0 and q +nl <=len (data ):
+                        try :
+                            return data [q :q +nl ].decode ("idna").lower ()
+                        except Exception :
+                            try :return data [q :q +nl ].decode ().lower ()
+                            except Exception :return None 
+                    q +=nl 
+                return None 
+            else :
+                p +=elen 
+        return None 
+    except Exception :
+        return None 
 
-    
-    
-    
-    
-# --- PRESEED از ایندکس SNI برای ipset (برای کاهش تاخیر) ---
-def _preseed_ipset_from_index(domain: str, show_page: bool):
-    base = _registrable_domain(domain) or _normalize_domain_or_none(domain) or domain.strip().lower().strip(".")
-    if not base:
-        return
-    v4, v6 = sni_index.get_ips_for_base(base)
-    set4 = IPSET4P if (show_page and PAGE_MODE_ENABLED) else IPSET4
-    set6 = IPSET6P if (show_page and PAGE_MODE_ENABLED) else IPSET6
-    for ip in v4:
-        _run_root(["ipset","add", set4, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
-        print(f"[netdash] preseed: {ip} -> {set4} (base={base})")
-    for ip in v6:
-        _run_root(["ipset","add", set6, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
-        print(f"[netdash] preseed: {ip} -> {set6} (base={base})")
-        
-def _preseed_ipset_from_index_for(rec: dict):
-    pat = (rec or {}).get("pattern","").strip()
-    iface = (rec or {}).get("iface") or None
-    if not pat or not iface: return
-    base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
-    if not base: return
-    set4, set6 = _ipset_names_for(rec)
-    ensure_ipset_and_rules_for_iface(iface, bool(rec.get("show_page")))
-    v4, v6 = sni_index.get_ips_for_base(base)
-    for ip in v4: _run_root(["ipset","add", set4, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
-    for ip in v6: _run_root(["ipset","add", set6, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+def _flush_all_ipsets ():
+    for name in (IPSET4 ,IPSET6 ,IPSET4P ,IPSET6P ):
+        try :
+            _run_root (["ipset","flush",name ])
+        except Exception :
+            pass 
 
+def _del_domain_from_iface_sets (rec :dict ):
+    pat =(rec or {}).get ("pattern","").strip ()
+    iface =(rec or {}).get ("iface")or None 
+    if not pat or not iface :return 
+    base =_domain_base (pat )
+    if not base :return 
+    v4 ,v6 =_collect_ips_for_base (base ,rec )
+    set4 ,set6 =_ipset_names_for (rec )
+    for ip in v4 :
+        try :_run_root (["ipset","del",set4 ,ip ])
+        except Exception :pass 
+    for ip in v6 :
+        try :_run_root (["ipset","del",set6 ,ip ])
+        except Exception :pass 
 
+def _del_domain_everywhere (rec ):
+    try :
+        pat =(rec or {}).get ("pattern","").strip ()
+        if not pat :
+            return 
+        base =_registrable_domain (pat )or _normalize_domain_or_none (pat )or pat .strip ().lower ().strip (".")
+        if not base :
+            return 
 
-    
-def _hostname_matches(host: str, base: str) -> bool:
-    """host endswith .base یا مساوی با base (هر دو نرمالایز)."""
-    try:
-        host = (host or "").strip().lower().strip(".")
-        base = _normalize_domain_or_none(base) or (base or "").strip().lower()
-        if not host or not base:
-            return False
-        return host == base or host.endswith("." + base)
-    except Exception:
-        return False
+        v4_idx ,v6_idx =sni_index .get_ips_for_base (base )
 
-def _extract_sni_from_clienthello(data: bytes):
-    """
-    از TLS ClientHello در TCP payload، SNI را در می‌آورد.
-    حداقل‌گرایانه و سریع؛ اگر پکت ناقص/تکه‌تکه باشد None می‌دهد.
-    """
-    try:
-        if not data or len(data) < 5:
-            return None
-        # TLS record header: type(1)=22(handshake), ver(2), len(2)
-        if data[0] != 22:
-            return None
-        p = 5
-        if len(data) < p + 4 or data[p] != 1:  # HandshakeType=ClientHello(1)
-            return None
-        hs_len = int.from_bytes(data[p+1:p+4], "big")
-        p += 4
-        if len(data) < p + hs_len:
-            return None  # احتمالاً تکه‌تکه شده
-        # skip: version(2) + random(32)
-        p += 2 + 32
-        if len(data) < p + 1: return None
-        sid_len = data[p]; p += 1 + sid_len
-        if len(data) < p + 2: return None
-        cs_len = int.from_bytes(data[p:p+2], "big"); p += 2 + cs_len
-        if len(data) < p + 1: return None
-        cm_len = data[p]; p += 1 + cm_len
-        if len(data) < p + 2: return None
-        ext_len = int.from_bytes(data[p:p+2], "big"); p += 2
-        end = min(len(data), p + ext_len)
-        while p + 4 <= end:
-            etype = int.from_bytes(data[p:p+2], "big"); p += 2
-            elen  = int.from_bytes(data[p:p+2], "big"); p += 2
-            if etype == 0:  # server_name
-                if p + 2 > len(data): return None
-                list_len = int.from_bytes(data[p:p+2], "big"); p += 2
-                q = p
-                while q + 3 <= len(data) and q < p + list_len:
-                    nt = data[q]; q += 1
-                    nl = int.from_bytes(data[q:q+2], "big"); q += 2
-                    if nt == 0 and q + nl <= len(data):
-                        try:
-                            return data[q:q+nl].decode("idna").lower()
-                        except Exception:
-                            try: return data[q:q+nl].decode().lower()
-                            except Exception: return None
-                    q += nl
-                return None
-            else:
-                p += elen
-        return None
-    except Exception:
-        return None
-    
-    
-    
+        v4_real =set (((rec .get ("realized")or {}).get ("v4")or []))
+        v6_real =set (((rec .get ("realized")or {}).get ("v6")or []))
 
-def _flush_all_ipsets():
-    """تمام ست‌های ipset مربوط به NetDash را خالی می‌کند."""
-    for name in (IPSET4, IPSET6, IPSET4P, IPSET6P):
-        try:
-            _run_root(["ipset", "flush", name])
-        except Exception:
-            pass
-            
-            
-            
-def _del_domain_from_iface_sets(rec: dict):
-    pat = (rec or {}).get("pattern","").strip()
-    iface = (rec or {}).get("iface") or None
-    if not pat or not iface: return
-    base = _domain_base(pat)
-    if not base: return
-    v4, v6 = _collect_ips_for_base(base, rec)
-    set4, set6 = _ipset_names_for(rec)
-    for ip in v4:
-        try: _run_root(["ipset","del", set4, ip])
-        except Exception: pass
-    for ip in v6:
-        try: _run_root(["ipset","del", set6, ip])
-        except Exception: pass
-            
-            
+        v4_now ,v6_now =_resolve_domain (base )
 
-def _del_domain_everywhere(rec):
-    """
-    همهٔ IPهایی که به هر طریقی به این دامنه وصل بوده‌اند را از هر چهار ipset حذف می‌کند.
-    rec همان آیتمِ فیلتر قبل از حذف است.
-    """
-    try:
-        pat = (rec or {}).get("pattern","").strip()
-        if not pat:
-            return
-        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
-        if not base:
-            return
+        v4_all =sorted (set (v4_idx )|v4_real |set (v4_now ))
+        v6_all =sorted (set (v6_idx )|v6_real |set (v6_now ))
 
-        # 1) از sni-index (تمام IPهای v4/v6 برای base و زیر دامنه‌ها)
-        v4_idx, v6_idx = sni_index.get_ips_for_base(base)
+        for ip in v4_all :
+            _run_root (["ipset","del",IPSET4 ,ip ])
+            _run_root (["ipset","del",IPSET4P ,ip ])
+        for ip in v6_all :
+            _run_root (["ipset","del",IPSET6 ,ip ])
+            _run_root (["ipset","del",IPSET6P ,ip ])
+    except Exception as e :
+        print ("[netdash] purge domain failed:",e )
 
-        # 2) از realized همین رکورد (چیزی که SNI-learner یا preseed قبلاً وارد کرده)
-        v4_real = set(((rec.get("realized") or {}).get("v4") or []))
-        v6_real = set(((rec.get("realized") or {}).get("v6") or []))
+def _del_domain_from_ipsets (domain :str ,show_page :bool ):
+    v4 ,v6 =_resolve_domain (domain )
+    sets =[]
+    if show_page :
+        sets =[(IPSET4P ,v4 ),(IPSET6P ,v6 )]
+    else :
+        sets =[(IPSET4 ,v4 ),(IPSET6 ,v6 )]
+    for setname ,arr in sets :
+        for ip in arr :
+            try :
+                _run_root (["ipset","del",setname ,ip ])
+            except Exception :
+                pass 
 
-        # 3) از DNS لحظه‌ای (ممکن است IP جدید باشد)
-        v4_now, v6_now = _resolve_domain(base)
+def _iptables_bin (ipv6 =False ):
+    candidates =("/usr/sbin/iptables","/sbin/iptables","/usr/bin/iptables","iptables")if not ipv6 else ("/usr/sbin/ip6tables","/sbin/ip6tables","/usr/bin/ip6tables","ip6tables")
+    for p in candidates :
+        if os .path .isabs (p )and os .path .exists (p ):
+            return p 
+    return candidates [-1 ]
 
-        v4_all = sorted(set(v4_idx) | v4_real | set(v4_now))
-        v6_all = sorted(set(v6_idx) | v6_real | set(v6_now))
+def _sudo_wrap (cmd ):
+    if os .geteuid ()!=0 :
+        return ["sudo","-n"]+cmd 
+    return cmd 
 
-        # 4) از هر چهار ست حذف کن (ممکن است قبلاً Page-mode بوده باشد)
-        for ip in v4_all:
-            _run_root(["ipset","del", IPSET4,  ip])
-            _run_root(["ipset","del", IPSET4P, ip])
-        for ip in v6_all:
-            _run_root(["ipset","del", IPSET6,  ip])
-            _run_root(["ipset","del", IPSET6P, ip])
-    except Exception as e:
-        print("[netdash] purge domain failed:", e)
+def _is_ip_or_cidr (s ):
+    try :
+        ipaddress .ip_network (s ,strict =False )
+        return True 
+    except Exception :
+        try :
+            ipaddress .ip_address (s )
+            return True 
+        except Exception :
+            return False 
 
+def _split_family (s ):
+    try :
+        net =ipaddress .ip_network (s ,strict =False )
+        return 'v6'if net .version ==6 else 'v4'
+    except Exception :
+        try :
+            addr =ipaddress .ip_address (s )
+            return 'v6'if addr .version ==6 else 'v4'
+        except Exception :
+            return None 
 
+def _resolve_domain (name ):
+    v4 ,v6 =set (),set ()
+    try :
+        infos =socket .getaddrinfo (name ,None )
+        for fam ,_ ,_ ,_ ,sockaddr in infos :
+            if fam ==socket .AF_INET :
+                v4 .add (sockaddr [0 ])
+            elif fam ==socket .AF_INET6 :
+                v6 .add (sockaddr [0 ])
+    except Exception :
+        pass 
+    return list (v4 ),list (v6 )
 
-def _del_domain_from_ipsets(domain: str, show_page: bool):
-    """
-    IPهای فعلیِ A/AAAA دامنه را resolve می‌کند و از ست درست حذف می‌کند.
-    توجه: شامل ساب‌دامنه‌هایی که الان resolve نشده‌اند نمی‌شود.
-    برای اطمینان کامل می‌توانیم بعدش flush کلی انجام دهیم (قابل‌تنظیم با ENV).
-    """
-    v4, v6 = _resolve_domain(domain)
-    sets = []
-    if show_page:
-        sets = [(IPSET4P, v4), (IPSET6P, v6)]
-    else:
-        sets = [(IPSET4,  v4), (IPSET6,  v6)]
-    for setname, arr in sets:
-        for ip in arr:
-            try:
-                _run_root(["ipset", "del", setname, ip])
-            except Exception:
-                pass
+def _normalize_domain_or_none (pat :str ):
+    s =(pat or "").strip ().lower ()
+    s =re .sub (r'^[a-z]+://','',s )
+    s =s .split ('/',1 )[0 ]
+    s =s .split (':',1 )[0 ]
+    if s .startswith ('*.'):
+        s =s [2 :]
+    s =s .strip ('.')
+    if not s or '.'not in s :
+        return None 
+    if not re .fullmatch (r'[0-9a-z.-]+',s ):
+        pass 
+    return s 
 
+def _domain_variants (dom :str ):
+    out =set ()
+    try :
+        puny =dom .encode ('idna').decode ('ascii')
+    except Exception :
+        puny =dom 
+    for d in {dom ,puny }:
+        d =d .strip ('.')
+        out .add (d )
+        out .add ('.'+d )
+    return out 
 
+def _mk_rule_cmds (dst_ip ,chain ,iface =None ,proto ="all",port =None ,ipv6 =False ):
+    binp =_iptables_bin (ipv6 )
+    base =[binp ,"-I",chain ]
+    if iface :
+        base +=["-o",iface ]
+    if proto and proto .lower ()!="all":
+        base +=["-p",proto .lower ()]
+        if port and str (port ).isdigit ():
+            base +=["--dport",str (int (port ))]
+    base +=["-d",str (dst_ip ),"-j","DROP"]
+    return _sudo_wrap (base )
 
-def _iptables_bin(ipv6=False):
-    candidates = ("/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables", "iptables") if not ipv6 else \
-                 ("/usr/sbin/ip6tables", "/sbin/ip6tables", "/usr/bin/ip6tables", "ip6tables")
-    for p in candidates:
-        if os.path.isabs(p) and os.path.exists(p):
-            return p
-    return candidates[-1]
+def _del_equivalent (cmd ):
+    out =cmd [:]
+    try :
+        i =out .index ("-I")
+        out [i ]="-D"
+    except ValueError :
 
-def _sudo_wrap(cmd):
-    if os.geteuid() != 0:
-        return ["sudo","-n"] + cmd
-    return cmd
+        out =[out [0 ],"-D"]+out [2 :]
+    return out 
 
-def _is_ip_or_cidr(s):
-    try:
-        ipaddress.ip_network(s, strict=False)
-        return True
-    except Exception:
-        try:
-            ipaddress.ip_address(s)
-            return True
-        except Exception:
-            return False
+def _chk_equivalent (cmd ):
+    out =cmd [:]
+    try :
+        i =out .index ("-I")
+        out [i ]="-C"
+    except ValueError :
+        out =[out [0 ],"-C"]+out [2 :]
+    return out 
 
-def _split_family(s):
-    """return ('v4'|'v6'|None) for a single IP or CIDR; None for domain."""
-    try:
-        net = ipaddress.ip_network(s, strict=False)
-        return 'v6' if net.version == 6 else 'v4'
-    except Exception:
-        try:
-            addr = ipaddress.ip_address(s)
-            return 'v6' if addr.version == 6 else 'v4'
-        except Exception:
-            return None
+def _mk_nat_redirect_http_cmd (dst_ip ,chain ,ipv6 =False ):
+    binp =_iptables_bin (ipv6 )
+    base =[binp ,"-t","nat","-I",chain ,"-p","tcp","-d",str (dst_ip ),"--dport","80",
+    "-j","REDIRECT","--to-ports",str (BLOCK_PORT )]
+    return _sudo_wrap (base )
 
-def _resolve_domain(name):
-    v4, v6 = set(), set()
-    try:
-        infos = socket.getaddrinfo(name, None)
-        for fam, _, _, _, sockaddr in infos:
-            if fam == socket.AF_INET:
-                v4.add(sockaddr[0])
-            elif fam == socket.AF_INET6:
-                v6.add(sockaddr[0])
-    except Exception:
-        pass
-    return list(v4), list(v6)
-    
-def _normalize_domain_or_none(pat: str):
-    s = (pat or "").strip().lower()
-    s = re.sub(r'^[a-z]+://', '', s)
-    s = s.split('/', 1)[0]
-    s = s.split(':', 1)[0]
-    if s.startswith('*.'):
-        s = s[2:]
-    s = s.strip('.')
-    if not s or '.' not in s:
-        return None
-    if not re.fullmatch(r'[0-9a-z.-]+', s):
-        pass
-    return s
+def _apply_nat_redirect (dst ,chain ,ipv6 ):
+    cmd =_mk_nat_redirect_http_cmd (dst ,chain ,ipv6 =ipv6 )
+    try :
+        subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+        return {"cmd":cmd ,"chain":chain ,"ipv6":bool (ipv6 )}
+    except subprocess .CalledProcessError :
+        return None 
 
-def _domain_variants(dom: str):
-    out = set()
-    try:
-        puny = dom.encode('idna').decode('ascii')
-    except Exception:
-        puny = dom
-    for d in {dom, puny}:
-        d = d.strip('.')
-        out.add(d)
-        out.add('.' + d)
-    return out    
-    
+def _normalize_domain (pat :str )->str :
+    d =_normalize_domain_or_none (pat )
+    return d if d is not None else (pat or "").strip ().lower ()
 
-def _mk_rule_cmds(dst_ip, chain, iface=None, proto="all", port=None, ipv6=False):
-    """
-    Build iptables/ip6tables -I commands to DROP traffic to dst_ip.
-    Applies to OUTPUT (local) و FORWARD (روتر). اگر iface باشد، -o iface می‌گیرد.
-    """
-    binp = _iptables_bin(ipv6)
-    base = [binp, "-I", chain]
-    if iface:
-        base += ["-o", iface]
-    if proto and proto.lower() != "all":
-        base += ["-p", proto.lower()]
-        if port and str(port).isdigit():
-            base += ["--dport", str(int(port))]
-    base += ["-d", str(dst_ip), "-j", "DROP"]
-    return _sudo_wrap(base)
-
-def _del_equivalent(cmd):
-    """convert a built -I rule to -D for deletion"""
-    out = cmd[:]
-    try:
-        i = out.index("-I")
-        out[i] = "-D"
-    except ValueError:
-        # fallback: if نبود، همان را با -D در اول جایگزین می‌کنیم
-        out = [out[0], "-D"] + out[2:]
-    return out
-
-
-
-def _chk_equivalent(cmd):
-    """یک دستور -I را به -C تبدیل می‌کند تا وجود قانون بررسی شود"""
-    out = cmd[:]
-    try:
-        i = out.index("-I")
-        out[i] = "-C"
-    except ValueError:
-        out = [out[0], "-C"] + out[2:]
-    return out
-
-
-def _mk_nat_redirect_http_cmd(dst_ip, chain, ipv6=False):
-    """
-    -t nat REDIRECT traffic destined to dst_ip:80 toward local BLOCK_PORT.
-    chain: "OUTPUT" (local) یا "PREROUTING" (ترافیک عبوری/روتر)
-    """
-    binp = _iptables_bin(ipv6)
-    base = [binp, "-t", "nat", "-I", chain, "-p", "tcp", "-d", str(dst_ip), "--dport", "80",
-            "-j", "REDIRECT", "--to-ports", str(BLOCK_PORT)]
-    return _sudo_wrap(base)
-
-def _apply_nat_redirect(dst, chain, ipv6):
-    cmd = _mk_nat_redirect_http_cmd(dst, chain, ipv6=ipv6)
-    try:
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return {"cmd": cmd, "chain": chain, "ipv6": bool(ipv6)}
-    except subprocess.CalledProcessError:
-        return None
-
-# اگر قبلاً نداری: یک نرمالایزر ساده روی دامنه
-def _normalize_domain(pat: str) -> str:
-    d = _normalize_domain_or_none(pat)  # همون که قبلاً اضافه کردی
-    return d if d is not None else (pat or "").strip().lower()
-
-def _add_sni_rules_for_domain(domain: str, iface: str | None = None):
-    rules = []
-    dom = _normalize_domain(domain)
-    if not dom:
-        return rules
-    for ipv6 in (False, True):
-        binp = _iptables_bin(ipv6)
-        for chain in ("FORWARD", "OUTPUT"):
-            cmd_insert = [binp, "-I", chain]
-            if iface:
-                cmd_insert += ["-o", iface]
-            cmd_insert += [
-                "-p","tcp","--dport","443",
-                "-m","conntrack","--ctstate","NEW",
-                "-m","string","--string", dom, "--algo","bm","--icase",
-                "-j","DROP"
+def _add_sni_rules_for_domain (domain :str ,iface :str |None =None ):
+    rules =[]
+    dom =_normalize_domain (domain )
+    if not dom :
+        return rules 
+    for ipv6 in (False ,True ):
+        binp =_iptables_bin (ipv6 )
+        for chain in ("FORWARD","OUTPUT"):
+            cmd_insert =[binp ,"-I",chain ]
+            if iface :
+                cmd_insert +=["-o",iface ]
+            cmd_insert +=[
+            "-p","tcp","--dport","443",
+            "-m","conntrack","--ctstate","NEW",
+            "-m","string","--string",dom ,"--algo","bm","--icase",
+            "-j","DROP"
             ]
-            cmd_check = _chk_equivalent(cmd_insert)
-            if _run_root(_sudo_wrap(cmd_check)) == 0:
-                continue
-            if _run_root(_sudo_wrap(cmd_insert)) == 0:
-                rules.append({"cmd": cmd_insert, "chain": chain, "ipv6": ipv6})
-    return rules
+            cmd_check =_chk_equivalent (cmd_insert )
+            if _run_root (_sudo_wrap (cmd_check ))==0 :
+                continue 
+            if _run_root (_sudo_wrap (cmd_insert ))==0 :
+                rules .append ({"cmd":cmd_insert ,"chain":chain ,"ipv6":ipv6 })
+    return rules 
 
+def _del_rule_obj (r ):
+    cmd =(r or {}).get ("cmd")or []
+    if not cmd :
+        return 
+    dcmd =_del_equivalent (cmd )
+    _run_root (_sudo_wrap (dcmd ))
 
+def _domain_base (s :str )->str |None :
+    s =(s or "").strip ()
+    base =_registrable_domain (s )or _normalize_domain_or_none (s )or s .strip ().lower ().strip (".")
+    return base if base and "."in base else None 
 
-def _del_rule_obj(r):
-    """قانون ذخیره‌شده را حذف می‌کند (معادل -D از روی -I)."""
-    cmd = (r or {}).get("cmd") or []
-    if not cmd:
-        return
-    dcmd = _del_equivalent(cmd)
-    _run_root(_sudo_wrap(dcmd))
+def _iter_other_blocked_domains (except_id =None ,except_base =None ):
+    try :
+        with filters .lock :
+            for rec in (filters .items or {}).values ():
+                if not isinstance (rec ,dict ):
+                    continue 
+                if except_id and rec .get ("id")==except_id :
+                    continue 
+                pat =(rec .get ("pattern")or "").strip ()
+                if not pat or _split_family (pat )is not None :
+                    continue 
+                base =_domain_base (pat )
+                if not base :
+                    continue 
+                if except_base and base ==except_base :
+                    continue 
+                yield base ,rec 
+    except Exception :
+        return 
 
-# === Safe cleanup helpers (domain-aware) ===
+def _collect_ips_for_base (base :str ,rec :dict |None =None ):
+    v4s ,v6s =set (),set ()
 
-def _domain_base(s: str) -> str | None:
-    s = (s or "").strip()
-    base = _registrable_domain(s) or _normalize_domain_or_none(s) or s.strip().lower().strip(".")
-    return base if base and "." in base else None
+    try :
+        v4i ,v6i =sni_index .get_ips_for_base (base )
+        v4s .update (v4i or [])
+        v6s .update (v6i or [])
+    except Exception :
+        pass 
 
-def _iter_other_blocked_domains(except_id=None, except_base=None):
-    """تمام دامنه‌های فعلاً-بلاک (به‌جز موردی که داریم حذف می‌کنیم) را بده."""
-    try:
-        with filters.lock:
-            for rec in (filters.items or {}).values():
-                if not isinstance(rec, dict):
-                    continue
-                if except_id and rec.get("id") == except_id:
-                    continue
-                pat = (rec.get("pattern") or "").strip()
-                if not pat or _split_family(pat) is not None:
-                    continue  # فقط دامنه
-                base = _domain_base(pat)
-                if not base:
-                    continue
-                if except_base and base == except_base:
-                    continue
-                yield base, rec
-    except Exception:
-        return
+    try :
+        v4d ,v6d =_resolve_domain (base )
+        v4s .update (v4d or [])
+        v6s .update (v6d or [])
+    except Exception :
+        pass 
 
-def _collect_ips_for_base(base: str, rec: dict | None = None):
-    """IPهای مرتبط با یک base را از SNI-index + DNS + realized جمع می‌کند."""
-    v4s, v6s = set(), set()
-    # از ایندکس SNI
-    try:
-        v4i, v6i = sni_index.get_ips_for_base(base)
-        v4s.update(v4i or [])
-        v6s.update(v6i or [])
-    except Exception:
-        pass
-    # DNS لحظه‌ای
-    try:
-        v4d, v6d = _resolve_domain(base)
-        v4s.update(v4d or [])
-        v6s.update(v6d or [])
-    except Exception:
-        pass
-    # realized رکوردِ خودِ دامنه (اگر دادیم)
-    if rec:
-        try:
-            v4s.update((rec.get("realized", {}) or {}).get("v4", []) or [])
-            v6s.update((rec.get("realized", {}) or {}).get("v6", []) or [])
-        except Exception:
-            pass
-    return sorted(v4s), sorted(v6s)
+    if rec :
+        try :
+            v4s .update ((rec .get ("realized",{})or {}).get ("v4",[])or [])
+            v6s .update ((rec .get ("realized",{})or {}).get ("v6",[])or [])
+        except Exception :
+            pass 
+    return sorted (v4s ),sorted (v6s )
 
-def _ip_needed_by_other_blocks(ip: str, fam: str, *, except_id=None, except_base=None) -> bool:
-    """اگر IP توسط دامنه‌های بلاکِ دیگر لازم است، True می‌دهد."""
-    for obase, orec in _iter_other_blocked_domains(except_id=except_id, except_base=except_base):
-        v4o, v6o = _collect_ips_for_base(obase, orec)
-        if fam == "v4" and ip in v4o:
-            return True
-        if fam == "v6" and ip in v6o:
-            return True
-    return False
+def _ip_needed_by_other_blocks (ip :str ,fam :str ,*,except_id =None ,except_base =None )->bool :
+    for obase ,orec in _iter_other_blocked_domains (except_id =except_id ,except_base =except_base ):
+        v4o ,v6o =_collect_ips_for_base (obase ,orec )
+        if fam =="v4"and ip in v4o :
+            return True 
+        if fam =="v6"and ip in v6o :
+            return True 
+    return False 
 
-def _del_ip_from_all_sets(ip: str, fam: str):
-    """IP را از تمام ست‌های مرتبط پاک کن (DROP و PAGE)."""
-    if fam == "v4":
-        for setname in (IPSET4, IPSET4P):
-            try: _run_root(["ipset", "del", setname, ip])
-            except Exception: pass
-    else:
-        for setname in (IPSET6, IPSET6P):
-            try: _run_root(["ipset", "del", setname, ip])
-            except Exception: pass
+def _del_ip_from_all_sets (ip :str ,fam :str ):
+    if fam =="v4":
+        for setname in (IPSET4 ,IPSET4P ):
+            try :_run_root (["ipset","del",setname ,ip ])
+            except Exception :pass 
+    else :
+        for setname in (IPSET6 ,IPSET6P ):
+            try :_run_root (["ipset","del",setname ,ip ])
+            except Exception :pass 
 
-def _del_domain_everywhere_safe(rec: dict):
-    """پس از حذف دامنه از لیست، همهٔ IPهای مرتبط با همان دامنه را—در صورت عدم نیازِ دامنه‌های دیگر—از ipsetها پاک می‌کند."""
-    try:
-        pat = (rec.get("pattern") or "").strip()
-        base = _domain_base(pat)
-        if not base:
-            return
-        v4, v6 = _collect_ips_for_base(base, rec)
+def _del_domain_everywhere_safe (rec :dict ):
+    try :
+        pat =(rec .get ("pattern")or "").strip ()
+        base =_domain_base (pat )
+        if not base :
+            return 
+        v4 ,v6 =_collect_ips_for_base (base ,rec )
 
-        for ip in v4:
-            if not _ip_needed_by_other_blocks(ip, "v4", except_id=rec.get("id"), except_base=base):
-                _del_ip_from_all_sets(ip, "v4")
+        for ip in v4 :
+            if not _ip_needed_by_other_blocks (ip ,"v4",except_id =rec .get ("id"),except_base =base ):
+                _del_ip_from_all_sets (ip ,"v4")
 
-        for ip in v6:
-            if not _ip_needed_by_other_blocks(ip, "v6", except_id=rec.get("id"), except_base=base):
-                _del_ip_from_all_sets(ip, "v6")
-    except Exception as e:
-        print("[netdash] safe-del error:", e)
+        for ip in v6 :
+            if not _ip_needed_by_other_blocks (ip ,"v6",except_id =rec .get ("id"),except_base =base ):
+                _del_ip_from_all_sets (ip ,"v6")
+    except Exception as e :
+        print ("[netdash] safe-del error:",e )
 
+class FilterStore :
+    def __init__ (self ,path ):
+        self .path =path 
+        self .items ={}
+        self .lock =threading .Lock ()
+        self .load ()
 
+    def load (self ):
+        try :
+            with open (self .path ,"r",encoding ="utf-8")as f :
+                obj =json .load (f )
+            raw_items =obj .get ("items",{})
+        except Exception :
+            raw_items ={}
 
-class FilterStore:
-    """
-    هر آیتم:
-      id, pattern, iface, proto, port, created,
-      realized: {v4:[], v6:[]},
-      show_page: bool,
-      backend: "ipset"|"legacy"
-    """
-    def __init__(self, path):
-        self.path = path
-        self.items = {}
-        self.lock = threading.Lock()
-        self.load()
+        items ={}
+        if isinstance (raw_items ,list ):
+            for it in raw_items :
+                rid =(it or {}).get ("id")or uuid .uuid4 ().hex [:12 ]
+                it ["id"]=rid 
+                items [rid ]=it 
+        elif isinstance (raw_items ,dict ):
+            for k ,v in (raw_items or {}).items ():
+                rid =(v or {}).get ("id")or str (k )
+                v ["id"]=rid 
+                items [rid ]=v 
 
-    def load(self):
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            raw_items = obj.get("items", {})
-        except Exception:
-            raw_items = {}
+        with self .lock :
+            self .items =items 
 
-        items = {}
-        if isinstance(raw_items, list):
-            for it in raw_items:
-                rid = (it or {}).get("id") or uuid.uuid4().hex[:12]
-                it["id"] = rid
-                items[rid] = it
-        elif isinstance(raw_items, dict):
-            for k, v in (raw_items or {}).items():
-                rid = (v or {}).get("id") or str(k)
-                v["id"] = rid
-                items[rid] = v
+        try :
+            for _rec in items .values ():
+                blocksreg .upsert_from_rec (_rec )
+                _sync_registry_for (_rec ["id"])
 
-        with self.lock:
-            self.items = items
-        
-        # رجیستر را با آیتم‌های موجود همگام کن
-        try:
-            for _rec in items.values():
-                blocksreg.upsert_from_rec(_rec)
-                _sync_registry_for(_rec["id"])   # ← این خط را اضافه کن
-                        
-        except Exception:
-            pass
+        except Exception :
+            pass 
 
-        # --- بازگردانی state کرنل در بوت ---
-        if USE_DNSMASQ_IPSET:
-            ensure_ipset_and_rules()
-            _rebuild_dnsmasq_conf_from_items(self.items)
-            
-            # per-iface ها: ipset و قوانین مخصوص‌شان را تضمین کن
-            try:
-                for _rec in items.values():
-                    if (_rec or {}).get("iface"):
-                        ensure_ipset_and_rules_for_iface(_rec["iface"], bool(_rec.get("show_page")))
-            except Exception as e:
-                print("[netdash] per-iface ensure warn:", e)
+        if USE_DNSMASQ_IPSET :
+            ensure_ipset_and_rules ()
+            _rebuild_dnsmasq_conf_from_items (self .items )
 
-            try:
-                has_domains = any(_split_family((v or {}).get("pattern","")) is None for v in self.items.values())
-                if not has_domains:
-                    _flush_all_ipsets()
-            except Exception:
-                pass
-            
-            
-            if SNI_BLOCK_ENABLED:
-                for rec in self.items.values():
-                    pat = (rec or {}).get("pattern", "").strip()
-                    if pat and _split_family(pat) is None:
-                        try:
-                            rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=(rec.get("iface") or None))
+            try :
+                for _rec in items .values ():
+                    if (_rec or {}).get ("iface"):
+                        ensure_ipset_and_rules_for_iface (_rec ["iface"],bool (_rec .get ("show_page")))
+            except Exception as e :
+                print ("[netdash] per-iface ensure warn:",e )
 
-                        except Exception as e:
-                            print(f"[netdash] SNI add failed for {pat}: {e}")
-                self.flush()
-        else:
-            # حالت legacy: قوانین ذخیره‌شده iptables را دوباره اعمال کن
-            for rec in list(items.values()):
-                for r in rec.get("rules", []):
-                    cmd = r.get("cmd") or []
-                    if not cmd or not isinstance(cmd, list):
-                        continue
-                    try:
-                        chk = _chk_equivalent(cmd)
-                        subprocess.check_call(chk, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        continue
-                    except subprocess.CalledProcessError:
-                        pass
-                    try:
-                        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except subprocess.CalledProcessError:
-                        try:
-                            base = [c for c in cmd if c not in ("sudo", "-n")]
-                            subprocess.check_call(base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        except Exception:
-                            pass
+            try :
+                has_domains =any (_split_family ((v or {}).get ("pattern",""))is None for v in self .items .values ())
+                if not has_domains :
+                    _flush_all_ipsets ()
+            except Exception :
+                pass 
 
-    def flush(self):
-        try:
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"v": 1, "items": self.items}, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
-        except Exception:
-            pass
+            if SNI_BLOCK_ENABLED :
+                for rec in self .items .values ():
+                    pat =(rec or {}).get ("pattern","").strip ()
+                    if pat and _split_family (pat )is None :
+                        try :
+                            rec ["sni_rules"]=_add_sni_rules_for_domain (pat ,iface =(rec .get ("iface")or None ))
 
-    def list(self):
-        with self.lock:
-            return list(self.items.values())
+                        except Exception as e :
+                            print (f"[netdash] SNI add failed for {pat}: {e}")
+                self .flush ()
+        else :
 
-    def add(self, pattern, iface=None, proto="all", port=None, show_page=False):
-        pat = (pattern or "").strip()
-        if not pat:
-            raise ValueError("pattern empty")
+            for rec in list (items .values ()):
+                for r in rec .get ("rules",[]):
+                    cmd =r .get ("cmd")or []
+                    if not cmd or not isinstance (cmd ,list ):
+                        continue 
+                    try :
+                        chk =_chk_equivalent (cmd )
+                        subprocess .check_call (chk ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+                        continue 
+                    except subprocess .CalledProcessError :
+                        pass 
+                    try :
+                        subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+                    except subprocess .CalledProcessError :
+                        try :
+                            base =[c for c in cmd if c not in ("sudo","-n")]
+                            subprocess .check_call (base ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+                        except Exception :
+                            pass 
 
-        fam = _split_family(pat)
-        fid = uuid.uuid4().hex[:12]
-        rec = {
-            "id": fid,
-            "pattern": pat,
-            "iface": iface or None,
-            "proto": (proto or "all").lower(),
-            "port": (int(port) if port else None),
-            "created": int(time.time()),
-            "realized": {"v4": [], "v6": []},
-            "show_page": bool(show_page),
-            "backend": "ipset" if USE_DNSMASQ_IPSET else "legacy",
+    def flush (self ):
+        try :
+            tmp =self .path +".tmp"
+            with open (tmp ,"w",encoding ="utf-8")as f :
+                json .dump ({"v":1 ,"items":self .items },f ,ensure_ascii =False ,indent =2 )
+            os .replace (tmp ,self .path )
+        except Exception :
+            pass 
+
+    def list (self ):
+        with self .lock :
+            return list (self .items .values ())
+
+    def add (self ,pattern ,iface =None ,proto ="all",port =None ,show_page =False ):
+        pat =(pattern or "").strip ()
+        if not pat :
+            raise ValueError ("pattern empty")
+
+        fam =_split_family (pat )
+        fid =uuid .uuid4 ().hex [:12 ]
+        rec ={
+        "id":fid ,
+        "pattern":pat ,
+        "iface":iface or None ,
+        "proto":(proto or "all").lower (),
+        "port":(int (port )if port else None ),
+        "created":int (time .time ()),
+        "realized":{"v4":[],"v6":[]},
+        "show_page":bool (show_page ),
+        "backend":"ipset"if USE_DNSMASQ_IPSET else "legacy",
         }
 
-        if USE_DNSMASQ_IPSET:
-            # --- دامنه ---
-            if fam is None:
-                # 1) ثبت آیتم + رجیستری
-                with self.lock:
-                    self.items[fid] = rec
-                    self.flush()
-                try:
-                    blocksreg.upsert_from_rec(rec)
-                except Exception:
-                    pass
+        if USE_DNSMASQ_IPSET :
 
-                # 2) dnsmasq فقط برای آیتم‌های global؛ per-iface عمداً skip می‌شود
-                _rebuild_dnsmasq_conf_from_items(self.items)
+            if fam is None :
 
-                # 3) preseed برای آیتم‌های per-interface از sni_index (بدون global کردن)
-                if SNI_INDEX_PRESEED_ON_ADD and iface:
-                    try:
-                        _preseed_ipset_from_index_for(rec)  # ensure_ipset_and_rules_for_iface را هم تضمین می‌کند
-                        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
-                        v4i, v6i = sni_index.get_ips_for_base(base)
-                        rec["realized"]["v4"] = sorted(set(rec["realized"].get("v4", [])) | set(v4i))
-                        rec["realized"]["v6"] = sorted(set(rec["realized"].get("v6", [])) | set(v6i))
-                        with self.lock:
-                            self.items[fid] = rec
-                            self.flush()
-                        try: _sync_registry_for(fid)
-                        except Exception: pass
-                        try: blocksreg.upsert_from_rec(rec)
-                        except Exception: pass
-                    except Exception as e:
-                        print("[netdash] preseed per-iface failed:", e)
+                with self .lock :
+                    self .items [fid ]=rec 
+                    self .flush ()
+                try :
+                    blocksreg .upsert_from_rec (rec )
+                except Exception :
+                    pass 
 
-                # 4) preseed برای آیتم‌های global
-                if SNI_INDEX_PRESEED_ON_ADD and not iface:
-                    try:
-                        _preseed_ipset_from_index(pat, show_page)
-                        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
-                        v4i, v6i = sni_index.get_ips_for_base(base)
-                        rec["realized"]["v4"] = list(sorted(set(rec["realized"].get("v4", [])) | set(v4i)))
-                        rec["realized"]["v6"] = list(sorted(set(rec["realized"].get("v6", [])) | set(v6i)))
-                        with self.lock:
-                            self.items[fid] = rec
-                            self.flush()
-                        try: _sync_registry_for(fid)
-                        except Exception: pass
-                        try: blocksreg.upsert_from_rec(rec)
-                        except Exception: pass
-                    except Exception as e:
-                        print("[netdash] preseed from index failed:", e)
+                _rebuild_dnsmasq_conf_from_items (self .items )
 
-                # 5) قوانین SNI (هم برای global هم per-iface)
-                if SNI_BLOCK_ENABLED:
-                    try:
-                        rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
-                        with self.lock:
-                            self.items[fid] = rec
-                            self.flush()
-                        try: blocksreg.upsert_from_rec(rec)
-                        except Exception: pass
-                        try: _sync_registry_for(fid)
-                        except Exception: pass
-                    except Exception as e:
-                        print(f"[netdash] SNI add failed for {pat}: {e}")
+                if SNI_INDEX_PRESEED_ON_ADD and iface :
+                    try :
+                        _preseed_ipset_from_index_for (rec )
+                        base =_registrable_domain (pat )or _normalize_domain_or_none (pat )or pat .strip ().lower ().strip (".")
+                        v4i ,v6i =sni_index .get_ips_for_base (base )
+                        rec ["realized"]["v4"]=sorted (set (rec ["realized"].get ("v4",[]))|set (v4i ))
+                        rec ["realized"]["v6"]=sorted (set (rec ["realized"].get ("v6",[]))|set (v6i ))
+                        with self .lock :
+                            self .items [fid ]=rec 
+                            self .flush ()
+                        try :_sync_registry_for (fid )
+                        except Exception :pass 
+                        try :blocksreg .upsert_from_rec (rec )
+                        except Exception :pass 
+                    except Exception as e :
+                        print ("[netdash] preseed per-iface failed:",e )
 
-                return rec
+                if SNI_INDEX_PRESEED_ON_ADD and not iface :
+                    try :
+                        _preseed_ipset_from_index (pat ,show_page )
+                        base =_registrable_domain (pat )or _normalize_domain_or_none (pat )or pat .strip ().lower ().strip (".")
+                        v4i ,v6i =sni_index .get_ips_for_base (base )
+                        rec ["realized"]["v4"]=list (sorted (set (rec ["realized"].get ("v4",[]))|set (v4i )))
+                        rec ["realized"]["v6"]=list (sorted (set (rec ["realized"].get ("v6",[]))|set (v6i )))
+                        with self .lock :
+                            self .items [fid ]=rec 
+                            self .flush ()
+                        try :_sync_registry_for (fid )
+                        except Exception :pass 
+                        try :blocksreg .upsert_from_rec (rec )
+                        except Exception :pass 
+                    except Exception as e :
+                        print ("[netdash] preseed from index failed:",e )
 
-            # --- IP/CIDR → مستقیم ipset (با حمایت per-interface در صورت وجود iface) ---
-            if iface:
-                ensure_ipset_and_rules_for_iface(iface, show_page)
-            s4, s6 = _ipset_names_for(rec)
+                if SNI_BLOCK_ENABLED :
+                    try :
+                        rec ["sni_rules"]=_add_sni_rules_for_domain (pat ,iface =iface )
+                        with self .lock :
+                            self .items [fid ]=rec 
+                            self .flush ()
+                        try :blocksreg .upsert_from_rec (rec )
+                        except Exception :pass 
+                        try :_sync_registry_for (fid )
+                        except Exception :pass 
+                    except Exception as e :
+                        print (f"[netdash] SNI add failed for {pat}: {e}")
 
-            if fam == 'v4':
-                _run_root(["ipset", "add", s4, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
-                rec["realized"]["v4"] = [pat]
-            else:  # fam == 'v6'
-                _run_root(["ipset", "add", s6, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
-                rec["realized"]["v6"] = [pat]
+                return rec 
 
-            with self.lock:
-                self.items[fid] = rec
-                self.flush()
+            if iface :
+                ensure_ipset_and_rules_for_iface (iface ,show_page )
+            s4 ,s6 =_ipset_names_for (rec )
 
-            try:
-                blocksreg.upsert_from_rec(rec)
-            except Exception as e:
-                print("[netdash] blocksreg upsert (ip/cidr) failed:", e)
+            if fam =='v4':
+                _run_root (["ipset","add",s4 ,pat ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+                rec ["realized"]["v4"]=[pat ]
+            else :
+                _run_root (["ipset","add",s6 ,pat ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+                rec ["realized"]["v6"]=[pat ]
 
-            return rec
+            with self .lock :
+                self .items [fid ]=rec 
+                self .flush ()
 
-        # ---- حالت legacy: iptables per-IP ----
-        rules = []
-        chains = ["OUTPUT", "FORWARD"]
-        if fam is None:
-            v4, v6 = _resolve_domain(pat)
-        elif fam == 'v4':
-            v4, v6 = [pat], []
-        else:
-            v4, v6 = [], [pat]
+            try :
+                blocksreg .upsert_from_rec (rec )
+            except Exception as e :
+                print ("[netdash] blocksreg upsert (ip/cidr) failed:",e )
 
-        if not v4 and not v6:
-            raise ValueError("آدرس/دامنه قابل resolved نیست یا نامعتبر است.")
+            return rec 
 
-        for ip in v4:
-            for ch in chains:
-                r = self._apply_one(ip, iface, proto, port, ch, ipv6=False)
-                if r: rules.append(r)
-        for ip in v6:
-            for ch in chains:
-                r = self._apply_one(ip, iface, proto, port, ch, ipv6=True)
-                if r: rules.append(r)
+        rules =[]
+        chains =["OUTPUT","FORWARD"]
+        if fam is None :
+            v4 ,v6 =_resolve_domain (pat )
+        elif fam =='v4':
+            v4 ,v6 =[pat ],[]
+        else :
+            v4 ,v6 =[],[pat ]
 
-        if show_page:
-            for ip in v4:
-                for ch in ("OUTPUT", "PREROUTING"):
-                    r = _apply_nat_redirect(ip, ch, ipv6=False)
-                    if r: rules.append(r)
-            for ip in v6:
-                for ch in ("OUTPUT", "PREROUTING"):
-                    r = _apply_nat_redirect(ip, ch, ipv6=True)
-                    if r: rules.append(r)
+        if not v4 and not v6 :
+            raise ValueError ("آدرس/دامنه قابل resolved نیست یا نامعتبر است.")
 
-        if not rules:
-            raise RuntimeError("هیچ قانون iptables/ip6tables اعمال نشد.")
-        rec["rules"] = rules
-        rec["realized"] = {"v4": v4, "v6": v6}
+        for ip in v4 :
+            for ch in chains :
+                r =self ._apply_one (ip ,iface ,proto ,port ,ch ,ipv6 =False )
+                if r :rules .append (r )
+        for ip in v6 :
+            for ch in chains :
+                r =self ._apply_one (ip ,iface ,proto ,port ,ch ,ipv6 =True )
+                if r :rules .append (r )
 
-        if SNI_BLOCK_ENABLED and fam is None:
-            try:
-                rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
-            except Exception:
-                pass
+        if show_page :
+            for ip in v4 :
+                for ch in ("OUTPUT","PREROUTING"):
+                    r =_apply_nat_redirect (ip ,ch ,ipv6 =False )
+                    if r :rules .append (r )
+            for ip in v6 :
+                for ch in ("OUTPUT","PREROUTING"):
+                    r =_apply_nat_redirect (ip ,ch ,ipv6 =True )
+                    if r :rules .append (r )
 
-        with self.lock:
-            self.items[fid] = rec
-            self.flush()
-        try:
-            blocksreg.upsert_from_rec(rec)
-        except Exception as e:
-            print("[netdash] blocksreg upsert (legacy) failed:", e)
+        if not rules :
+            raise RuntimeError ("هیچ قانون iptables/ip6tables اعمال نشد.")
+        rec ["rules"]=rules 
+        rec ["realized"]={"v4":v4 ,"v6":v6 }
 
-        return rec
+        if SNI_BLOCK_ENABLED and fam is None :
+            try :
+                rec ["sni_rules"]=_add_sni_rules_for_domain (pat ,iface =iface )
+            except Exception :
+                pass 
 
-    def _apply_one(self, dst, iface, proto, port, chain, ipv6):
-        cmd = _mk_rule_cmds(dst, chain, iface=iface, proto=proto, port=port, ipv6=ipv6)
-        if _run_root(cmd) == 0:
-            return {"cmd": cmd, "chain": chain, "ipv6": bool(ipv6)}
-        return None
+        with self .lock :
+            self .items [fid ]=rec 
+            self .flush ()
+        try :
+            blocksreg .upsert_from_rec (rec )
+        except Exception as e :
+            print ("[netdash] blocksreg upsert (legacy) failed:",e )
 
-    def remove(self, fid):
-        # پیدا کردن رکورد
-        with self.lock:
-            rec = self.items.get(fid)
-            if not rec:
-                for k, v in list(self.items.items()):
-                    if (v or {}).get("id") == fid:
-                        fid, rec = k, v
-                        break
-            if not rec:
-                return False
+        return rec 
 
-        # ۱) قوانین SNI
-        for r in (rec.get("sni_rules") or []):
-            try:
-                _del_rule_obj(r)
-            except Exception:
-                pass
+    def _apply_one (self ,dst ,iface ,proto ,port ,chain ,ipv6 ):
+        cmd =_mk_rule_cmds (dst ,chain ,iface =iface ,proto =proto ,port =port ,ipv6 =ipv6 )
+        if _run_root (cmd )==0 :
+            return {"cmd":cmd ,"chain":chain ,"ipv6":bool (ipv6 )}
+        return None 
 
-        pat = (rec or {}).get("pattern", "").strip()
-        fam = _split_family(pat)
+    def remove (self ,fid ):
 
-        if USE_DNSMASQ_IPSET:
-            # --- دامنه ---
-            if fam is None:
-                # حذف از حافظه + بازسازی dnsmasq
-                with self.lock:
-                    self.items.pop(fid, None)
-                    self.flush()
+        with self .lock :
+            rec =self .items .get (fid )
+            if not rec :
+                for k ,v in list (self .items .items ()):
+                    if (v or {}).get ("id")==fid :
+                        fid ,rec =k ,v 
+                        break 
+            if not rec :
+                return False 
 
-                _rebuild_dnsmasq_conf_from_items(self.items)
+        for r in (rec .get ("sni_rules")or []):
+            try :
+                _del_rule_obj (r )
+            except Exception :
+                pass 
 
-                # اگر per-interface بود، ست مخصوص همان iface را هم پاک کن
-                try:
-                    if (rec or {}).get("iface"):
-                        _del_domain_from_iface_sets(rec)
-                except Exception as e:
-                    print("[netdash] per-iface purge warn:", e)
+        pat =(rec or {}).get ("pattern","").strip ()
+        fam =_split_family (pat )
 
-                # پاکسازی امن از ست‌های سراسری (اگر دیگر لازم نباشند)
-                try:
-                    _del_domain_everywhere_safe(rec)
-                except Exception as e:
-                    print("[netdash] safe-del warn:", e)
+        if USE_DNSMASQ_IPSET :
 
-                # اگر دیگر دامنه‌ای نداریم، ست‌های سراسری را flush کن
-                any_domains = False
-                with self.lock:
-                    for rr in self.items.values():
-                        if _split_family((rr or {}).get("pattern", "")) is None:
-                            any_domains = True
-                            break
-                if not any_domains:
-                    _flush_all_ipsets()
+            if fam is None :
 
-                # حذف از رجیستری
-                try:
-                    blocksreg.remove(fid)
-                except Exception as e:
-                    print("[netdash] blocksreg remove (domain) failed:", e)
+                with self .lock :
+                    self .items .pop (fid ,None )
+                    self .flush ()
 
-                return True
+                _rebuild_dnsmasq_conf_from_items (self .items )
 
-            # --- IP/CIDR ---
-            s4, s6 = _ipset_names_for(rec)
-            if fam == 'v4':
-                try: _run_root(["ipset", "del", s4, pat])
-                except Exception: pass
-            elif fam == 'v6':
-                try: _run_root(["ipset", "del", s6, pat])
-                except Exception: pass
+                try :
+                    if (rec or {}).get ("iface"):
+                        _del_domain_from_iface_sets (rec )
+                except Exception as e :
+                    print ("[netdash] per-iface purge warn:",e )
 
-            with self.lock:
-                self.items.pop(fid, None)
-                self.flush()
+                try :
+                    _del_domain_everywhere_safe (rec )
+                except Exception as e :
+                    print ("[netdash] safe-del warn:",e )
 
-            try:
-                blocksreg.remove(fid)
-            except Exception as e:
-                print("[netdash] blocksreg remove (ip/cidr) failed:", e)
+                any_domains =False 
+                with self .lock :
+                    for rr in self .items .values ():
+                        if _split_family ((rr or {}).get ("pattern",""))is None :
+                            any_domains =True 
+                            break 
+                if not any_domains :
+                    _flush_all_ipsets ()
 
-            return True
+                try :
+                    blocksreg .remove (fid )
+                except Exception as e :
+                    print ("[netdash] blocksreg remove (domain) failed:",e )
 
-        # ---- legacy: حذف قوانین iptables ذخیره‌شده ----
-        for r in (rec.get("rules", []) or []):
-            cmd = r.get("cmd") or []
-            dcmd = _del_equivalent(cmd)
-            if _run_root(dcmd) != 0:
-                base = [c for c in dcmd if c not in ("sudo", "-n")]
-                _run_root(base)
-        with self.lock:
-            self.items.pop(fid, None)
-            self.flush()
+                return True 
 
-        try:
-            blocksreg.remove(fid)
-        except Exception as e:
-            print("[netdash] blocksreg remove (legacy) failed:", e)
+            s4 ,s6 =_ipset_names_for (rec )
+            if fam =='v4':
+                try :_run_root (["ipset","del",s4 ,pat ])
+                except Exception :pass 
+            elif fam =='v6':
+                try :_run_root (["ipset","del",s6 ,pat ])
+                except Exception :pass 
 
-        return True
+            with self .lock :
+                self .items .pop (fid ,None )
+                self .flush ()
 
+            try :
+                blocksreg .remove (fid )
+            except Exception as e :
+                print ("[netdash] blocksreg remove (ip/cidr) failed:",e )
 
+            return True 
 
+        for r in (rec .get ("rules",[])or []):
+            cmd =r .get ("cmd")or []
+            dcmd =_del_equivalent (cmd )
+            if _run_root (dcmd )!=0 :
+                base =[c for c in dcmd if c not in ("sudo","-n")]
+                _run_root (base )
+        with self .lock :
+            self .items .pop (fid ,None )
+            self .flush ()
 
+        try :
+            blocksreg .remove (fid )
+        except Exception as e :
+            print ("[netdash] blocksreg remove (legacy) failed:",e )
 
-class SNILearner:
-    """
-    ترافیک TCP/443 را روی ifaceهای تعیین‌شده sniff می‌کند،
-    SNI را از ClientHello می‌خواند، و اگر زیرمجموعهٔ یکی از دامنه‌های بلاک‌شده بود،
-    IP مقصد را به ipset مناسب اضافه می‌کند (با timeout).
-    """
-    def __init__(self, ifaces=None):
-        self.ifaces = list(ifaces) if ifaces else None
-        self.running = False
-        self._recent = {}         # کلید: (fam, dst_ip) → زمان آخرین ثبت
-        self._recent_ttl = 60.0   # ثانیه؛ بازه‌ی ددیوب
-    def _match_any_blocked(self, host):
-        """اگر host زیرمجموعهٔ یکی از patternهای دامنه در FilterStore باشد، همان رکورد را برگردان."""
-        try:
-            with filters.lock:
-                for rec in filters.items.values():
-                    pat = (rec or {}).get("pattern","").strip()
-                    if not pat or _split_family(pat) is not None:
-                        continue  # IP/CIDR نیستیم دامنه می‌خواهیم
-                    if _hostname_matches(host, pat):
-                        return rec  # اولین match کافی است
-        except Exception:
-            pass
-        return None
+        return True 
 
-    def _handle_packet(self, pkt):
-        try:
-            from scapy.layers.inet import TCP, IP
-            from scapy.layers.inet6 import IPv6
-    
-            if not pkt.haslayer(TCP):
-                return
-            tcp = pkt[TCP]
-            if tcp.dport != 443:
-                return
-    
-            payload = bytes(tcp.payload or b"")
-            if not payload:
-                return
-    
-            host = _extract_sni_from_clienthello(payload)
-            if not host:
-                return
-    
-            # v4/v6 و مقصد
-            if IP in pkt:
-                fam, dst_ip = "v4", pkt[IP].dst
-            elif IPv6 in pkt:
-                fam, dst_ip = "v6", pkt[IPv6].dst
-            else:
-                return
-    
-            iface_name = getattr(pkt, "sniffed_on", None)
-    
-            # لاگ خام + ایندکس
-            _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam, base=None, iface=iface_name)
-            sni_index.update(host, dst_ip, fam, iface=iface_name)
-    
-            # آیا زیرمجموعهٔ دامنهٔ بلاک‌شده است؟
-            rec = self._match_any_blocked(host)
-            if not rec:
-                return
-    
-            # لاگ match
-            _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam, base=rec.get("pattern"), iface=iface_name)
-    
-            # --- DEDUPE ---
-            iface_target = (rec.get("iface") or None)  # per-interface؟
-            dedupe_key = (fam, dst_ip, iface_target or "GLOBAL")
-            now = time.time()
-            last = self._recent.get(dedupe_key)
-            if last and (now - last) < self._recent_ttl:
-                return
-            self._recent[dedupe_key] = now
-    
-            keyfam = "v4" if fam == "v4" else "v6"
-    
-            if iface_target:
-                # --- per-interface ---
-                ensure_ipset_and_rules_for_iface(iface_target, bool(rec.get("show_page")))
-                set4, set6 = _ipset_names_for(rec)
-                try:
-                    if fam == "v4":
-                        _run_root(["ipset", "add", set4, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
-                    else:
-                        _run_root(["ipset", "add", set6, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
-                    print(f"[netdash] SNI-add(per-iface): {dst_ip} -> {(set4 if fam=='v4' else set6)}  host={host}  iface={iface_target}")
-                except Exception:
-                    pass
-    
-                # realized/registry
-                try:
-                    with filters.lock:
-                        rr = filters.items.get(rec["id"])
-                        if rr:
-                            arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
-                            if dst_ip not in arr:
-                                arr.append(dst_ip)
-                        filters.flush()
-                except Exception:
-                    pass
-                try: _sync_registry_for(rec["id"])
-                except Exception: pass
-                try: blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
-                except Exception: pass
-                return
-    
-            # --- GLOBAL ---
-            use_page = bool(rec.get("show_page") and PAGE_MODE_ENABLED)
-            setname = {
-                ("v4", False): IPSET4,
-                ("v6", False): IPSET6,
-                ("v4", True):  IPSET4P,
-                ("v6", True):  IPSET6P,
-            }[(fam, use_page)]
-    
-            _run_root(["ipset", "add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
-            print(f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
-    
-            try:
-                with filters.lock:
-                    rr = filters.items.get(rec["id"])
-                    if rr:
-                        arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
-                        if dst_ip not in arr:
-                            arr.append(dst_ip)
-                    filters.flush()
-            except Exception:
-                pass
-            try: _sync_registry_for(rec["id"])
-            except Exception: pass
-            try: blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
-            except Exception: pass
-    
-        except Exception as e:
-            print("[netdash] SNI learner error:", e)
+class SNILearner :
+    def __init__ (self ,ifaces =None ):
+        self .ifaces =list (ifaces )if ifaces else None 
+        self .running =False 
+        self ._recent ={}
+        self ._recent_ttl =60.0 
+    def _match_any_blocked (self ,host ):
+        try :
+            with filters .lock :
+                for rec in filters .items .values ():
+                    pat =(rec or {}).get ("pattern","").strip ()
+                    if not pat or _split_family (pat )is not None :
+                        continue 
+                    if _hostname_matches (host ,pat ):
+                        return rec 
+        except Exception :
+            pass 
+        return None 
 
+    def _handle_packet (self ,pkt ):
+        try :
+            from scapy .layers .inet import TCP ,IP 
+            from scapy .layers .inet6 import IPv6 
 
-            
-            # ----- حالت GLOBAL قدیمی (مثل قبل) -----
-            use_page = bool(rec.get("show_page") and PAGE_MODE_ENABLED)
-            setname = {
-                ("v4", False): IPSET4,
-                ("v6", False): IPSET6,
-                ("v4", True):  IPSET4P,
-                ("v6", True):  IPSET6P,
-            }[(fam, use_page)]
-            
-            _run_root(["ipset", "add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
-            print(f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
-            
-            try:
-                with filters.lock:
-                    rr = filters.items.get(rec["id"])
-                    if rr:
-                        arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
-                        if dst_ip not in arr:
-                            arr.append(dst_ip)
-                    filters.flush()
-            except Exception:
-                pass
-            try: _sync_registry_for(rec["id"])
-            except Exception: pass
-            try: blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
-            except Exception: pass
+            if not pkt .haslayer (TCP ):
+                return 
+            tcp =pkt [TCP ]
+            if tcp .dport !=443 :
+                return 
 
+            payload =bytes (tcp .payload or b"")
+            if not payload :
+                return 
 
-                
-        except Exception as e:
-            print("[netdash] SNI learner error:", e)
+            host =_extract_sni_from_clienthello (payload )
+            if not host :
+                return 
 
+            if IP in pkt :
+                fam ,dst_ip ="v4",pkt [IP ].dst 
+            elif IPv6 in pkt :
+                fam ,dst_ip ="v6",pkt [IPv6 ].dst 
+            else :
+                return 
 
-    def start(self):
-        if not SNI_LEARN_ENABLED:
-            print("[netdash] SNI learner disabled (NETDASH_SNI_LEARN=0)")
-            return
-        try:
-            from scapy.all import sniff
-        except Exception as e:
-            if AUTO_PIP_INSTALL:
-                try:
-                    import sys, subprocess
-                    subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", "scapy"])
-                    from scapy.all import sniff
-                except Exception as e2:
-                    print("[netdash] SNI learner disabled: scapy install failed:", e2)
-                    return
-            else:
-                print("[netdash] SNI learner disabled: scapy not available:", e)
-                return
-    
-        self.running = True
-        def run():
-            flt = "tcp dst port 443"
-            kwargs = {"filter": flt, "prn": self._handle_packet, "store": False}
-            if self.ifaces:
-                kwargs["iface"] = self.ifaces
-            print(f"[netdash] SNI learner started on: {self.ifaces or 'ALL'}")
-            try:
-                sniff(**kwargs)
-            except Exception as e:
-                print("[netdash] SNI learner stopped:", e)
-        threading.Thread(target=run, daemon=True).start()
+            iface_name =getattr (pkt ,"sniffed_on",None )
 
+            _append_sni_log (kind ="sni",host =host ,dst_ip =dst_ip ,fam =fam ,base =None ,iface =iface_name )
+            sni_index .update (host ,dst_ip ,fam ,iface =iface_name )
 
+            rec =self ._match_any_blocked (host )
+            if not rec :
+                return 
 
+            _append_sni_log (kind ="sni",host =host ,dst_ip =dst_ip ,fam =fam ,base =rec .get ("pattern"),iface =iface_name )
 
-filters = FilterStore(FILTERS_FILE)
+            iface_target =(rec .get ("iface")or None )
+            dedupe_key =(fam ,dst_ip ,iface_target or "GLOBAL")
+            now =time .time ()
+            last =self ._recent .get (dedupe_key )
+            if last and (now -last )<self ._recent_ttl :
+                return 
+            self ._recent [dedupe_key ]=now 
 
+            keyfam ="v4"if fam =="v4"else "v6"
 
-try:
-    if AUTO_ENFORCE_DNS:  _ensure_dns_redirection()
-    if AUTO_BLOCK_DOT:    _ensure_block_dot()
-    if AUTO_PRELOAD_META: _preload_blocklist()   # این یکی به filters نیاز دارد
-except Exception as e:
-    print("[netdash] bootstrap warning:", e)
+            if iface_target :
 
+                ensure_ipset_and_rules_for_iface (iface_target ,bool (rec .get ("show_page")))
+                set4 ,set6 =_ipset_names_for (rec )
+                try :
+                    if fam =="v4":
+                        _run_root (["ipset","add",set4 ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+                    else :
+                        _run_root (["ipset","add",set6 ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+                    print (f"[netdash] SNI-add(per-iface): {dst_ip} -> {(set4 if fam=='v4' else set6)}  host={host}  iface={iface_target}")
+                except Exception :
+                    pass 
 
+                try :
+                    with filters .lock :
+                        rr =filters .items .get (rec ["id"])
+                        if rr :
+                            arr =rr .setdefault ("realized",{}).setdefault (keyfam ,[])
+                            if dst_ip not in arr :
+                                arr .append (dst_ip )
+                        filters .flush ()
+                except Exception :
+                    pass 
+                try :_sync_registry_for (rec ["id"])
+                except Exception :pass 
+                try :blocksreg .add_realized_ip (rec ["id"],keyfam ,dst_ip )
+                except Exception :pass 
+                return 
 
-    
-#mohamamd#
-def _tc_bin():
+            use_page =bool (rec .get ("show_page")and PAGE_MODE_ENABLED )
+            setname ={
+            ("v4",False ):IPSET4 ,
+            ("v6",False ):IPSET6 ,
+            ("v4",True ):IPSET4P ,
+            ("v6",True ):IPSET6P ,
+            }[(fam ,use_page )]
+
+            _run_root (["ipset","add",setname ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+            print (f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
+
+            try :
+                with filters .lock :
+                    rr =filters .items .get (rec ["id"])
+                    if rr :
+                        arr =rr .setdefault ("realized",{}).setdefault (keyfam ,[])
+                        if dst_ip not in arr :
+                            arr .append (dst_ip )
+                    filters .flush ()
+            except Exception :
+                pass 
+            try :_sync_registry_for (rec ["id"])
+            except Exception :pass 
+            try :blocksreg .add_realized_ip (rec ["id"],keyfam ,dst_ip )
+            except Exception :pass 
+
+        except Exception as e :
+            print ("[netdash] SNI learner error:",e )
+
+            use_page =bool (rec .get ("show_page")and PAGE_MODE_ENABLED )
+            setname ={
+            ("v4",False ):IPSET4 ,
+            ("v6",False ):IPSET6 ,
+            ("v4",True ):IPSET4P ,
+            ("v6",True ):IPSET6P ,
+            }[(fam ,use_page )]
+
+            _run_root (["ipset","add",setname ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
+            print (f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
+
+            try :
+                with filters .lock :
+                    rr =filters .items .get (rec ["id"])
+                    if rr :
+                        arr =rr .setdefault ("realized",{}).setdefault (keyfam ,[])
+                        if dst_ip not in arr :
+                            arr .append (dst_ip )
+                    filters .flush ()
+            except Exception :
+                pass 
+            try :_sync_registry_for (rec ["id"])
+            except Exception :pass 
+            try :blocksreg .add_realized_ip (rec ["id"],keyfam ,dst_ip )
+            except Exception :pass 
+
+        except Exception as e :
+            print ("[netdash] SNI learner error:",e )
+
+    def start (self ):
+        if not SNI_LEARN_ENABLED :
+            print ("[netdash] SNI learner disabled (NETDASH_SNI_LEARN=0)")
+            return 
+        try :
+            from scapy .all import sniff 
+        except Exception as e :
+            if AUTO_PIP_INSTALL :
+                try :
+                    import sys ,subprocess 
+                    subprocess .check_call ([sys .executable ,"-m","pip","-q","install","scapy"])
+                    from scapy .all import sniff 
+                except Exception as e2 :
+                    print ("[netdash] SNI learner disabled: scapy install failed:",e2 )
+                    return 
+            else :
+                print ("[netdash] SNI learner disabled: scapy not available:",e )
+                return 
+
+        self .running =True 
+        def run ():
+            flt ="tcp dst port 443"
+            kwargs ={"filter":flt ,"prn":self ._handle_packet ,"store":False }
+            if self .ifaces :
+                kwargs ["iface"]=self .ifaces 
+            print (f"[netdash] SNI learner started on: {self.ifaces or 'ALL'}")
+            try :
+                sniff (**kwargs )
+            except Exception as e :
+                print ("[netdash] SNI learner stopped:",e )
+        threading .Thread (target =run ,daemon =True ).start ()
+
+filters =FilterStore (FILTERS_FILE )
+
+try :
+    if AUTO_ENFORCE_DNS :_ensure_dns_redirection ()
+    if AUTO_BLOCK_DOT :_ensure_block_dot ()
+    if AUTO_PRELOAD_META :_preload_blocklist ()
+except Exception as e :
+    print ("[netdash] bootstrap warning:",e )
+
+def _tc_bin ():
     for p in ("/sbin/tc","/usr/sbin/tc","/usr/bin/tc","tc"):
-        if os.path.isabs(p) and os.path.exists(p):
-            return p
+        if os .path .isabs (p )and os .path .exists (p ):
+            return p 
     return "tc"
 
-def tc_status(iface):
-    res = {
-        "up":   {"active": False, "rate_mbit": None},
-        "down": {"active": False, "rate_mbit": None},
+def tc_status (iface ):
+    res ={
+    "up":{"active":False ,"rate_mbit":None },
+    "down":{"active":False ,"rate_mbit":None },
     }
-    try:
-        out = subprocess.check_output([_tc_bin(), "qdisc", "show", "dev", iface],
-                                      text=True, stderr=subprocess.DEVNULL)
-        if " tbf " in out or out.strip().startswith("qdisc tbf"):
-            m = re.search(r"rate\s+([0-9.]+)Mbit", out)
-            res["up"]["active"] = True
-            res["up"]["rate_mbit"] = float(m.group(1)) if m else None
-    except Exception:
-        pass
-    # IFB برای دانلود
-    ifb = _ifb_name(iface)
-    try:
-        out2 = subprocess.check_output([_tc_bin(), "qdisc", "show", "dev", ifb],
-                                       text=True, stderr=subprocess.DEVNULL)
-        if " tbf " in out2 or out2.strip().startswith("qdisc tbf"):
-            m2 = re.search(r"rate\s+([0-9.]+)Mbit", out2)
-            res["down"]["active"] = True
-            res["down"]["rate_mbit"] = float(m2.group(1)) if m2 else None
-    except Exception:
-        pass
+    try :
+        out =subprocess .check_output ([_tc_bin (),"qdisc","show","dev",iface ],
+        text =True ,stderr =subprocess .DEVNULL )
+        if " tbf "in out or out .strip ().startswith ("qdisc tbf"):
+            m =re .search (r"rate\s+([0-9.]+)Mbit",out )
+            res ["up"]["active"]=True 
+            res ["up"]["rate_mbit"]=float (m .group (1 ))if m else None 
+    except Exception :
+        pass 
 
-    any_active = res["up"]["active"] or res["down"]["active"]
-    if any_active:
-        return {"active": True, "algo": "tbf", "rate_mbit": res["up"]["rate_mbit"] or res["down"]["rate_mbit"], "detail": res}
-    return {"active": False, "algo": None, "rate_mbit": None, "detail": res}
+    ifb =_ifb_name (iface )
+    try :
+        out2 =subprocess .check_output ([_tc_bin (),"qdisc","show","dev",ifb ],
+        text =True ,stderr =subprocess .DEVNULL )
+        if " tbf "in out2 or out2 .strip ().startswith ("qdisc tbf"):
+            m2 =re .search (r"rate\s+([0-9.]+)Mbit",out2 )
+            res ["down"]["active"]=True 
+            res ["down"]["rate_mbit"]=float (m2 .group (1 ))if m2 else None 
+    except Exception :
+        pass 
 
+    any_active =res ["up"]["active"]or res ["down"]["active"]
+    if any_active :
+        return {"active":True ,"algo":"tbf","rate_mbit":res ["up"]["rate_mbit"]or res ["down"]["rate_mbit"],"detail":res }
+    return {"active":False ,"algo":None ,"rate_mbit":None ,"detail":res }
 
-def tc_limit(iface, rate_mbit, burst_kbit=32, latency_ms=400):
-    cmd = [_tc_bin(), "qdisc", "replace", "dev", iface, "root",
-           "tbf", "rate", f"{float(rate_mbit)}mbit",
-           "burst", f"{int(burst_kbit)}kbit",
-           "latency", f"{int(latency_ms)}ms"]
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
-    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def tc_limit (iface ,rate_mbit ,burst_kbit =32 ,latency_ms =400 ):
+    cmd =[_tc_bin (),"qdisc","replace","dev",iface ,"root",
+    "tbf","rate",f"{float(rate_mbit)}mbit",
+    "burst",f"{int(burst_kbit)}kbit",
+    "latency",f"{int(latency_ms)}ms"]
+    if os .geteuid ()!=0 :
+        cmd =["sudo","-n"]+cmd 
+    subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
 
-def tc_clear(iface):
-    cmd = [_tc_bin(), "qdisc", "del", "dev", iface, "root"]
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
-    try:
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        pass
+def tc_clear (iface ):
+    cmd =[_tc_bin (),"qdisc","del","dev",iface ,"root"]
+    if os .geteuid ()!=0 :
+        cmd =["sudo","-n"]+cmd 
+    try :
+        subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+    except subprocess .CalledProcessError :
+        pass 
 
-# === Helpers for download shaping via IFB ===
-def _safe_ifname(s):
-    return re.sub(r'[^a-zA-Z0-9_.-]+', '-', str(s))
+def _safe_ifname (s ):
+    return re .sub (r'[^a-zA-Z0-9_.-]+','-',str (s ))
 
-def _ifb_name(iface):
-    # IFNAMSIZ=16 => حداکثر 15 کاراکتر
-    base = _safe_ifname(iface)
-    name = f"ifb-{base}"
-    return name[:15]
+def _ifb_name (iface ):
 
-def _ip_run(args):
-    ipbin = _find_ip_binary()
-    cmd = [ipbin] + list(args)
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
-    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base =_safe_ifname (iface )
+    name =f"ifb-{base}"
+    return name [:15 ]
 
-def _ensure_ifb(iface):
-    ifb = _ifb_name(iface)
-    # اگر نبود، بساز و Up کن
-    try:
-        _ip_run(["link", "show", ifb])
-    except subprocess.CalledProcessError:
-        try:
-            # اگر کرنل‌ماژول ifb لود نیست، تلاش کن
-            cmd = ["modprobe", "ifb"]
-            if os.geteuid() != 0: cmd = ["sudo","-n"] + cmd
-            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        _ip_run(["link", "add", ifb, "type", "ifb"])
-    _ip_run(["link", "set", ifb, "up"])
-    return ifb
+def _ip_run (args ):
+    ipbin =_find_ip_binary ()
+    cmd =[ipbin ]+list (args )
+    if os .geteuid ()!=0 :
+        cmd =["sudo","-n"]+cmd 
+    subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
 
-def tc_limit_down(iface, rate_mbit, burst_kbit=32, latency_ms=400):
-    """
-    دانلود را با IFB محدود می‌کند: ingress روی iface و TBF روی ifb-<iface>
-    """
-    ifb = _ensure_ifb(iface)
-    # ingress روی اینترفیس اصلی
-    cmd1 = [_tc_bin(), "qdisc", "replace", "dev", iface, "ingress"]
-    # redirect همه ingress به ifb
-    cmd2 = [_tc_bin(), "filter", "add", "dev", iface, "parent", "ffff:",
-            "protocol", "all", "u32", "match", "u32", "0", "0",
-            "action", "mirred", "egress", "redirect", "dev", ifb]
-    # TBF روی ifb (دانلود)
-    cmd3 = [_tc_bin(), "qdisc", "replace", "dev", ifb, "root", "tbf",
-            "rate", f"{float(rate_mbit)}mbit",
-            "burst", f"{int(burst_kbit)}kbit",
-            "latency", f"{int(latency_ms)}ms"]
-    for c in (cmd1, cmd2, cmd3):
-        if os.geteuid() != 0: c = ["sudo","-n"] + c
-        subprocess.check_call(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def _ensure_ifb (iface ):
+    ifb =_ifb_name (iface )
 
-def tc_clear_down(iface):
-    ifb = _ifb_name(iface)
-    # پاک‌کردن ingress و TBF روی ifb
+    try :
+        _ip_run (["link","show",ifb ])
+    except subprocess .CalledProcessError :
+        try :
+
+            cmd =["modprobe","ifb"]
+            if os .geteuid ()!=0 :cmd =["sudo","-n"]+cmd 
+            subprocess .check_call (cmd ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+        except Exception :
+            pass 
+        _ip_run (["link","add",ifb ,"type","ifb"])
+    _ip_run (["link","set",ifb ,"up"])
+    return ifb 
+
+def tc_limit_down (iface ,rate_mbit ,burst_kbit =32 ,latency_ms =400 ):
+    ifb =_ensure_ifb (iface )
+
+    cmd1 =[_tc_bin (),"qdisc","replace","dev",iface ,"ingress"]
+
+    cmd2 =[_tc_bin (),"filter","add","dev",iface ,"parent","ffff:",
+    "protocol","all","u32","match","u32","0","0",
+    "action","mirred","egress","redirect","dev",ifb ]
+
+    cmd3 =[_tc_bin (),"qdisc","replace","dev",ifb ,"root","tbf",
+    "rate",f"{float(rate_mbit)}mbit",
+    "burst",f"{int(burst_kbit)}kbit",
+    "latency",f"{int(latency_ms)}ms"]
+    for c in (cmd1 ,cmd2 ,cmd3 ):
+        if os .geteuid ()!=0 :c =["sudo","-n"]+c 
+        subprocess .check_call (c ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+
+def tc_clear_down (iface ):
+    ifb =_ifb_name (iface )
+
     for c in (
-        [_tc_bin(), "qdisc", "del", "dev", iface, "ingress"],
-        [_tc_bin(), "qdisc", "del", "dev", ifb, "root"],
+    [_tc_bin (),"qdisc","del","dev",iface ,"ingress"],
+    [_tc_bin (),"qdisc","del","dev",ifb ,"root"],
     ):
-        if os.geteuid() != 0: c = ["sudo","-n"] + c
-        try:
-            subprocess.check_call(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            pass
-    # اختیاری: حذف ifb
-    try:
-        _ip_run(["link", "set", ifb, "down"])
-        _ip_run(["link", "del", ifb])
-    except Exception:
-        pass
+        if os .geteuid ()!=0 :c =["sudo","-n"]+c 
+        try :
+            subprocess .check_call (c ,stdout =subprocess .DEVNULL ,stderr =subprocess .DEVNULL )
+        except subprocess .CalledProcessError :
+            pass 
 
+    try :
+        _ip_run (["link","set",ifb ,"down"])
+        _ip_run (["link","del",ifb ])
+    except Exception :
+        pass 
 
-
-
-# ------------------ UI ------------------
-HTML = r"""
+HTML =r"""
 <!doctype html>
 <html lang="fa" dir="ltr">
 <head>
@@ -3217,223 +2919,202 @@ HTML = r"""
 </html>
 """
 
+@app .route ("/api/debug/sync-registry-now",methods =["POST"])
+def api_debug_sync_now ():
+    _require_token ()
+    with filters .lock :
+        ids =[it .get ("id")for it in (filters .items or {}).values ()if it and it .get ("id")]
+    for fid in ids :
+        _sync_registry_for (fid )
+    return jsonify ({"ok":True ,"n":len (ids )})
 
-# ------------------ Routes ------------------
+@app .route ("/api/debug/rebuild-reg",methods =["POST"])
+def api_debug_rebuild_reg ():
+    _require_token ()
 
-@app.route("/api/debug/sync-registry-now", methods=["POST"])
-def api_debug_sync_now():
-    _require_token()
-    with filters.lock:
-        ids = [it.get("id") for it in (filters.items or {}).values() if it and it.get("id")]
-    for fid in ids:
-        _sync_registry_for(fid)
-    return jsonify({"ok": True, "n": len(ids)})
+    with blocksreg .lock :
+        blocksreg .obj ={"v":1 ,"items":{}}
+        blocksreg .flush (force =True )
 
+    with filters .lock :
+        for rec in filters .items .values ():
+            try :
+                blocksreg .upsert_from_rec (rec )
+                pat =(rec .get ("pattern")or "").strip ()
+                if pat and _split_family (pat )is None :
+                    base =_registrable_domain (pat )or _normalize_domain_or_none (pat )or pat 
+                    v4i ,v6i =sni_index .get_ips_for_base (base )
+                    rv4 =sorted (set ((rec .get ("realized")or {}).get ("v4",[]))|set (v4i or []))
+                    rv6 =sorted (set ((rec .get ("realized")or {}).get ("v6",[]))|set (v6i or []))
+                    blocksreg .set_realized (rec ["id"],rv4 ,rv6 )
+            except Exception as e :
+                print ("[netdash] rebuild-reg warn:",e )
 
-@app.route("/api/debug/rebuild-reg", methods=["POST"])
-def api_debug_rebuild_reg():
-    _require_token()
+    return jsonify ({"ok":True ,"n":len (blocksreg .obj .get ('items',{}))})
 
-    # رجیستری را خالی کن
-    with blocksreg.lock:
-        blocksreg.obj = {"v": 1, "items": {}}
-        blocksreg.flush(force=True)
+@app .route ("/api/sni-index/<base>")
+def api_sni_index_base (base ):
+    base =(base or "").strip ().lower ().strip (".")
+    v4 ,v6 =sni_index .get_ips_for_base (base )
+    return jsonify ({"base":base ,"v4":v4 ,"v6":v6 })
 
-    # از روی فیلترها دوباره بساز و با sni_index غنی‌سازی کن
-    with filters.lock:
-        for rec in filters.items.values():
-            try:
-                blocksreg.upsert_from_rec(rec)
-                pat = (rec.get("pattern") or "").strip()
-                if pat and _split_family(pat) is None:
-                    base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat
-                    v4i, v6i = sni_index.get_ips_for_base(base)
-                    rv4 = sorted(set((rec.get("realized") or {}).get("v4", [])) | set(v4i or []))
-                    rv6 = sorted(set((rec.get("realized") or {}).get("v6", [])) | set(v6i or []))
-                    blocksreg.set_realized(rec["id"], rv4, rv6)
-            except Exception as e:
-                print("[netdash] rebuild-reg warn:", e)
+@app .route ("/api/debug/why-ip/<ip>")
+def api_debug_why_ip (ip ):
+    ip =(ip or "").strip ()
+    in_sets =[]
+    for name in (IPSET4 ,IPSET4P ,IPSET6 ,IPSET6P ):
+        try :
+            if _run_root (["ipset","test",name ,ip ])==0 :
+                in_sets .append (name )
+        except Exception :
+            pass 
 
-    return jsonify({"ok": True, "n": len(blocksreg.obj.get('items', {}))})
+    with filters .lock :
+        blocks =[(r .get ("id"),r .get ("pattern"))for r in filters .items .values ()if r and _split_family (r .get ("pattern",""))is None ]
 
+    seen_in =[]
+    try :
+        for bid ,pat in blocks :
+            base =_registrable_domain (pat )or _normalize_domain_or_none (pat )or pat 
+            v4 ,v6 =sni_index .get_ips_for_base (base )
+            if ip in v4 or ip in v6 :
+                seen_in .append (base )
+    except Exception :
+        pass 
 
+    return jsonify ({"ip":ip ,"in_sets":in_sets ,"seen_in_bases":seen_in ,"blocked_domains_now":[p for _ ,p in blocks ]})
 
+@app .route ("/")
+def home ():
+    html =render_template_string (HTML ,max_points =MAX_POINTS ,token =CONTROL_TOKEN )
+    resp =make_response (html )
+    resp .headers ["Cache-Control"]="no-store"
+    return resp 
 
-@app.route("/api/sni-index/<base>")
-def api_sni_index_base(base):
-    base = (base or "").strip().lower().strip(".")
-    v4, v6 = sni_index.get_ips_for_base(base)
-    return jsonify({"base": base, "v4": v4, "v6": v6})
+@app .route ("/api/filters/flush-sets",methods =["POST"])
+def api_filters_flush_sets ():
+    _require_token ()
+    _flush_all_ipsets ()
+    return jsonify ({"ok":True })
 
-@app.route("/api/debug/why-ip/<ip>")
-def api_debug_why_ip(ip):
-    ip = (ip or "").strip()
-    in_sets = []
-    for name in (IPSET4, IPSET4P, IPSET6, IPSET6P):
-        try:
-            if _run_root(["ipset","test", name, ip]) == 0:
-                in_sets.append(name)
-        except Exception:
-            pass
+@app .route ("/api/interfaces")
+def api_interfaces ():
+    return jsonify (get_interfaces_info ())
 
-    # چه دامنه‌هایی الان بلاک هستند؟
-    with filters.lock:
-        blocks = [ (r.get("id"), r.get("pattern")) for r in filters.items.values() if r and _split_family(r.get("pattern","")) is None ]
+@app .route ("/api/live")
+def api_live ():
+    return jsonify (monitor .snapshot ())
 
-    # این IP در sni-index متعلق به کدام baseها بوده؟
-    seen_in = []
-    try:
-        for bid, pat in blocks:
-            base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat
-            v4, v6 = sni_index.get_ips_for_base(base)
-            if ip in v4 or ip in v6:
-                seen_in.append(base)
-    except Exception:
-        pass
+@app .route ("/api/history")
+def api_history ():
+    return jsonify (history .export ())
 
-    return jsonify({"ip": ip, "in_sets": in_sets, "seen_in_bases": seen_in, "blocked_domains_now": [p for _,p in blocks]})
+@app .route ("/api/ping")
+def api_ping ():
+    return jsonify (pingmon .snapshot ())
 
-
-@app.route("/")
-def home():
-    html = render_template_string(HTML, max_points=MAX_POINTS, token=CONTROL_TOKEN)
-    resp = make_response(html)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-    
-@app.route("/api/filters/flush-sets", methods=["POST"])
-def api_filters_flush_sets():
-    _require_token()
-    _flush_all_ipsets()
-    return jsonify({"ok": True})
-
-@app.route("/api/interfaces")
-def api_interfaces():
-    return jsonify(get_interfaces_info())
-
-@app.route("/api/live")
-def api_live():
-    return jsonify(monitor.snapshot())
-
-@app.route("/api/history")
-def api_history():
-    return jsonify(history.export())
-
-@app.route("/api/ping")
-def api_ping():
-    return jsonify(pingmon.snapshot())
-
-@app.route("/api/report/<scope>")
-def api_report(scope):
+@app .route ("/api/report/<scope>")
+def api_report (scope ):
     if scope not in ("daily","monthly"):
-        abort(400, "scope must be daily|monthly")
-    key, data = periods.get_scope(scope)
-    total_rx = sum(int(v.get("rx",0)) for v in data.values())
-    total_tx = sum(int(v.get("tx",0)) for v in data.values())
-    return jsonify({"scope": scope, "key": key, "ifaces": data, "sum": {"rx": total_rx, "tx": total_tx}})
+        abort (400 ,"scope must be daily|monthly")
+    key ,data =periods .get_scope (scope )
+    total_rx =sum (int (v .get ("rx",0 ))for v in data .values ())
+    total_tx =sum (int (v .get ("tx",0 ))for v in data .values ())
+    return jsonify ({"scope":scope ,"key":key ,"ifaces":data ,"sum":{"rx":total_rx ,"tx":total_tx }})
 
-@app.route("/api/iface/<iface>/down", methods=["POST"])
-def api_iface_down(iface):
-    return iface_action(iface, "down")
+@app .route ("/api/iface/<iface>/down",methods =["POST"])
+def api_iface_down (iface ):
+    return iface_action (iface ,"down")
 
-@app.route("/api/iface/<iface>/up", methods=["POST"])
-def api_iface_up(iface):
-    return iface_action(iface, "up")
+@app .route ("/api/iface/<iface>/up",methods =["POST"])
+def api_iface_up (iface ):
+    return iface_action (iface ,"up")
 
+@app .route ("/api/shape/<iface>/limit",methods =["POST"])
+def api_shape_limit (iface ):
+    if not can_control (iface ):
+        abort (403 ,description ="Interface not permitted")
+    _require_token ()
+    body =request .get_json (silent =True )or {}
+    direction =(body .get ("direction")or "up").strip ().lower ()
+    rate =float (body .get ("rate_mbit",0 ))
+    if rate <=0 :
+        abort (400 ,"rate_mbit must be > 0")
+    burst =int (body .get ("burst_kbit",32 ))
+    latency =int (body .get ("latency_ms",400 ))
+    try :
+        if direction =="down":
+            tc_limit_down (iface ,rate ,burst ,latency )
+        else :
+            tc_limit (iface ,rate ,burst ,latency )
+        return jsonify ({"ok":True ,"iface":iface ,"direction":direction ,"rate_mbit":rate })
+    except subprocess .CalledProcessError as e :
+        return jsonify ({"ok":False ,"error":str (e )}),500 
 
-@app.route("/api/shape/<iface>/limit", methods=["POST"])
-def api_shape_limit(iface):
-    if not can_control(iface):
-        abort(403, description="Interface not permitted")
-    _require_token()
-    body = request.get_json(silent=True) or {}
-    direction = (body.get("direction") or "up").strip().lower()  # up | down
-    rate = float(body.get("rate_mbit", 0))
-    if rate <= 0:
-        abort(400, "rate_mbit must be > 0")
-    burst = int(body.get("burst_kbit", 32))
-    latency = int(body.get("latency_ms", 400))
-    try:
-        if direction == "down":
-            tc_limit_down(iface, rate, burst, latency)
-        else:
-            tc_limit(iface, rate, burst, latency)
-        return jsonify({"ok": True, "iface": iface, "direction": direction, "rate_mbit": rate})
-    except subprocess.CalledProcessError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+@app .route ("/api/filters",methods =["GET"])
+def api_filters_list ():
+    _require_token ()
+    return jsonify ({"items":filters .list ()})
 
+@app .route ("/api/filters",methods =["POST"])
+def api_filters_add ():
+    _require_token ()
+    body =request .get_json (silent =True )or {}
+    pattern =(body .get ("pattern")or "").strip ()
+    iface =(body .get ("iface")or "").strip ()or None 
+    proto =(body .get ("proto")or "all").strip ().lower ()
+    port =body .get ("port")
+    show_page =bool (body .get ("show_page"))
 
-@app.route("/api/filters", methods=["GET"])
-def api_filters_list():
-    _require_token()  # برای امنیت، هم‌راستای بقیه کنترل‌ها
-    return jsonify({"items": filters.list()})
+    if iface and not can_control (iface ):
+        abort (403 ,description ="Interface not permitted")
+    try :
+        rec =filters .add (pattern ,iface =iface ,proto =proto ,port =port ,show_page =show_page )
+        return jsonify ({"ok":True ,"item":rec })
+    except ValueError as e :
+        return jsonify ({"ok":False ,"error":str (e )}),400 
+    except Exception as e :
+        return jsonify ({"ok":False ,"error":str (e )}),500 
 
-@app.route("/api/filters", methods=["POST"])
-def api_filters_add():
-    _require_token()
-    body = request.get_json(silent=True) or {}
-    pattern = (body.get("pattern") or "").strip()
-    iface   = (body.get("iface") or "").strip() or None
-    proto   = (body.get("proto") or "all").strip().lower()
-    port    = body.get("port")
-    show_page = bool(body.get("show_page"))
+@app .route ("/api/filters/<fid>",methods =["DELETE"])
+def api_filters_del (fid ):
+    _require_token ()
+    ok =filters .remove (fid )
+    if ok :
+        return jsonify ({"ok":True })
+    return jsonify ({"ok":False ,"error":"Not found"}),404 
 
-    if iface and not can_control(iface):
-        abort(403, description="Interface not permitted")
-    try:
-        rec = filters.add(pattern, iface=iface, proto=proto, port=port, show_page=show_page)
-        return jsonify({"ok": True, "item": rec})
-    except ValueError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-        
-        
+@app .route ("/api/shape/<iface>/clear",methods =["POST"])
+def api_shape_clear (iface ):
+    if not can_control (iface ):
+        abort (403 ,description ="Interface not permitted")
+    _require_token ()
+    body =request .get_json (silent =True )or {}
+    direction =(body .get ("direction")or "up").strip ().lower ()
+    if direction in ("both","all"):
+        tc_clear (iface )
+        tc_clear_down (iface )
+    elif direction =="down":
+        tc_clear_down (iface )
+    else :
+        tc_clear (iface )
+    return jsonify ({"ok":True ,"iface":iface ,"direction":direction })
 
-@app.route("/api/filters/<fid>", methods=["DELETE"])
-def api_filters_del(fid):
-    _require_token()
-    ok = filters.remove(fid)
-    if ok:
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": "Not found"}), 404
+def _flush_on_exit ():
+    try :
+        history .flush (force =True )
+        totals .flush (force =True )
+        periods .flush (force =True )
+    except Exception :
+        pass 
 
-
-
-@app.route("/api/shape/<iface>/clear", methods=["POST"])
-def api_shape_clear(iface):
-    if not can_control(iface):
-        abort(403, description="Interface not permitted")
-    _require_token()
-    body = request.get_json(silent=True) or {}
-    direction = (body.get("direction") or "up").strip().lower()  # up | down | both
-    if direction in ("both", "all"):
-        tc_clear(iface)
-        tc_clear_down(iface)
-    elif direction == "down":
-        tc_clear_down(iface)
-    else:
-        tc_clear(iface)
-    return jsonify({"ok": True, "iface": iface, "direction": direction})
-
-
-
-def _flush_on_exit():
-    try:
-        history.flush(force=True)
-        totals.flush(force=True)
-        periods.flush(force=True)
-    except Exception:
-        pass
-
-if __name__ == "__main__":
-    try:
-        monitor.start()
-        start_block_server()
-        sni_learner = SNILearner(ifaces=SNI_LEARN_IFACES or None)
-        sni_learner.start()
-        _start_registry_autosync(interval=5.0)
-        app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
-    finally:
-        _flush_on_exit()
-
+if __name__ =="__main__":
+    try :
+        monitor .start ()
+        start_block_server ()
+        sni_learner =SNILearner (ifaces =SNI_LEARN_IFACES or None )
+        sni_learner .start ()
+        _start_registry_autosync (interval =5.0 )
+        app .run (host =HOST ,port =PORT ,debug =False ,use_reloader =False )
+    finally :
+        _flush_on_exit ()
