@@ -1086,6 +1086,55 @@ def _ipt_ensure(args, table=None, v6=False):
     if _run_root(check) != 0:
         _run_root(insert)
 
+
+# --- per-iface ipset helpers ---
+def _iface_suffix(iface: str | None) -> str:
+    if not iface:
+        return ""
+    s = re.sub(r'[^a-zA-Z0-9_.-]+', '-', str(iface))
+    return "__" + s
+
+def _ipset_names_for(obj, show_page: bool | None = None):
+    """
+    obj: یا dict رکورد فیلتر است یا نام اینترفیس.
+    اگر show_page=None و obj دیکشنری بود، از rec['show_page'] استفاده می‌شود.
+    """
+    if isinstance(obj, dict):
+        iface = obj.get("iface") or None
+        sp = obj.get("show_page", False) if show_page is None else bool(show_page)
+    else:
+        iface = obj or None
+        sp = bool(show_page)
+    sfx = _iface_suffix(iface)
+    if sp and PAGE_MODE_ENABLED:
+        return f"{IPSET4P}{sfx}", f"{IPSET6P}{sfx}"
+    return f"{IPSET4}{sfx}", f"{IPSET6}{sfx}"
+    
+
+def ensure_ipset_and_rules_for_iface(iface: str, show_page: bool):
+    """ipsetهای مخصوص iface را بساز و قوانین DROP/NAT per-iface را تضمین کن."""
+    set4, set6 = _ipset_names_for(iface, show_page)
+    _run_root(["ipset","create", set4,"hash:net","family","inet","timeout",str(IPSET_TIMEOUT),"-exist"])
+    _run_root(["ipset","create", set6,"hash:net","family","inet6","timeout",str(IPSET_TIMEOUT),"-exist"])
+
+    # DROP فقط روی خروجی همان اینترفیس
+    _ipt_ensure(["FORWARD","-o",iface,"-m","set","--match-set",set4,"dst","-j","DROP"])
+    _ipt_ensure(["OUTPUT","-o",iface,"-m","set","--match-set",set4,"dst","-j","DROP"])
+    _ipt_ensure(["FORWARD","-o",iface,"-m","set","--match-set",set6,"dst","-j","DROP"], v6=True)
+    _ipt_ensure(["OUTPUT","-o",iface,"-m","set","--match-set",set6,"dst","-j","DROP"], v6=True)
+
+    # اختیاری: ریدایرکت صفحهٔ مسدودسازی برای HTTP لوکال روی همان iface
+    if PAGE_MODE_ENABLED and show_page:
+        _ipt_ensure(["OUTPUT","-p","tcp","-o",iface,"-m","set","--match-set", set4,
+                     "dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat")
+        _ipt_ensure(["OUTPUT","-p","tcp","-o",iface,"-m","set","--match-set", set6,
+                     "dst","--dport","80","-j","REDIRECT","--to-ports",str(BLOCK_PORT)], table="nat", v6=True)
+
+
+
+
+
+
 def ensure_ipset_and_rules():
     # 1) بساز/مطمئن شو ipsetها هستند
     _run_root(["ipset","create",IPSET4,"hash:net","family","inet","timeout",str(IPSET_TIMEOUT),"-exist"])
@@ -1195,6 +1244,8 @@ def _preload_blocklist():
 def _prime_dnsmasq_for_items(items_dict):
     domains = set()
     for it in items_dict.values():
+        if (it or {}).get("iface"):   # ⬅️ per-interface را رها کن
+            continue
         pat = (it or {}).get("pattern","").strip()
         if pat and _split_family(pat) is None:
             domains.add(pat)
@@ -1221,21 +1272,20 @@ def _prime_dnsmasq_for_items(items_dict):
 
 
 def _rebuild_dnsmasq_conf_from_items(items_dict):
-    """
-    از روی self.items، فایل dnsmasq داینامیک بساز:
-      - دامنه‌هایی که show_page=False ⇒ ستِ Drop
-      - دامنه‌هایی که show_page=True  ⇒ ستِ Page (ریدایرکت HTTP)
-    """
     lines = []
     for it in items_dict.values():
         pat = (it or {}).get("pattern","").strip()
+
+        # آیتم‌های per-interface وارد dnsmasq نشوند تا global نشوند
+        if (it or {}).get("iface"):
+            continue
+
         fam = _split_family(pat)
         if fam is None and pat:  # domain
             dom = _normalize_domain_or_none(pat)
             if not dom:
-                # اگر اسمِ بدون پسوند یا نامعتبر بود، رد می‌کنیم
                 continue
-            variants = _domain_variants(dom)  # { 'example.com', '.example.com', 'xn--....', '.xn--....' }
+            variants = _domain_variants(dom)
             if PAGE_MODE_ENABLED and it.get("show_page"):
                 for v in variants:
                     lines.append(f"ipset=/{v}/{IPSET4P}")
@@ -1245,18 +1295,25 @@ def _rebuild_dnsmasq_conf_from_items(items_dict):
                     lines.append(f"ipset=/{v}/{IPSET4}")
                     lines.append(f"ipset=/{v}/{IPSET6}")
 
-    content = ("# netdash dynamic blocklist\n" + "\n".join(lines) + ("\n" if lines else ""))
+    content = "# netdash dynamic blocklist\n" + "\n".join(lines) + ("\n" if lines else "")
     try:
         os.makedirs(os.path.dirname(DNSMASQ_CONF), exist_ok=True)
     except Exception:
         pass
-    tmp = DNSMASQ_CONF + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, DNSMASQ_CONF)
+    try:
+        tmp = DNSMASQ_CONF + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, DNSMASQ_CONF)
+    except Exception as e:
+        print("[netdash] dnsmasq conf write failed:", e)
+        return
 
     _dnsmasq_hup()
-    _prime_dnsmasq_for_items(items_dict)  # همین بس است؛ خطِ اضافه حذف شد
+    _prime_dnsmasq_for_items(items_dict)
+
+
+
 
     
     
@@ -1277,6 +1334,20 @@ def _preseed_ipset_from_index(domain: str, show_page: bool):
         _run_root(["ipset","add", set6, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
         print(f"[netdash] preseed: {ip} -> {set6} (base={base})")
         
+def _preseed_ipset_from_index_for(rec: dict):
+    pat = (rec or {}).get("pattern","").strip()
+    iface = (rec or {}).get("iface") or None
+    if not pat or not iface: return
+    base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
+    if not base: return
+    set4, set6 = _ipset_names_for(rec)
+    ensure_ipset_and_rules_for_iface(iface, bool(rec.get("show_page")))
+    v4, v6 = sni_index.get_ips_for_base(base)
+    for ip in v4: _run_root(["ipset","add", set4, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+    for ip in v6: _run_root(["ipset","add", set6, ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+
+
+
     
 def _hostname_matches(host: str, base: str) -> bool:
     """host endswith .base یا مساوی با base (هر دو نرمالایز)."""
@@ -1352,6 +1423,25 @@ def _flush_all_ipsets():
             _run_root(["ipset", "flush", name])
         except Exception:
             pass
+            
+            
+            
+def _del_domain_from_iface_sets(rec: dict):
+    pat = (rec or {}).get("pattern","").strip()
+    iface = (rec or {}).get("iface") or None
+    if not pat or not iface: return
+    base = _domain_base(pat)
+    if not base: return
+    v4, v6 = _collect_ips_for_base(base, rec)
+    set4, set6 = _ipset_names_for(rec)
+    for ip in v4:
+        try: _run_root(["ipset","del", set4, ip])
+        except Exception: pass
+    for ip in v6:
+        try: _run_root(["ipset","del", set6, ip])
+        except Exception: pass
+            
+            
 
 def _del_domain_everywhere(rec):
     """
@@ -1732,6 +1822,13 @@ class FilterStore:
             ensure_ipset_and_rules()
             _rebuild_dnsmasq_conf_from_items(self.items)
             
+            # per-iface ها: ipset و قوانین مخصوص‌شان را تضمین کن
+            try:
+                for _rec in items.values():
+                    if (_rec or {}).get("iface"):
+                        ensure_ipset_and_rules_for_iface(_rec["iface"], bool(_rec.get("show_page")))
+            except Exception as e:
+                print("[netdash] per-iface ensure warn:", e)
 
             try:
                 has_domains = any(_split_family((v or {}).get("pattern","")) is None for v in self.items.values())
@@ -1806,9 +1903,9 @@ class FilterStore:
         }
 
         if USE_DNSMASQ_IPSET:
-            # دامنه → dnsmasq/ipset
+            # --- دامنه ---
             if fam is None:
-                # 1) آیتم را ثبت کن و dnsmasq را از روی لیست کامل بساز
+                # 1) ثبت آیتم + رجیستری
                 with self.lock:
                     self.items[fid] = rec
                     self.flush()
@@ -1816,12 +1913,30 @@ class FilterStore:
                     blocksreg.upsert_from_rec(rec)
                 except Exception:
                     pass
-                                    
-            
+
+                # 2) dnsmasq فقط برای آیتم‌های global؛ per-iface عمداً skip می‌شود
                 _rebuild_dnsmasq_conf_from_items(self.items)
-            
-                # 2) (اختیاری) preseed بر اساس sni-index برای کاهش تاخیر
-                if SNI_INDEX_PRESEED_ON_ADD:
+
+                # 3) preseed برای آیتم‌های per-interface از sni_index (بدون global کردن)
+                if SNI_INDEX_PRESEED_ON_ADD and iface:
+                    try:
+                        _preseed_ipset_from_index_for(rec)  # ensure_ipset_and_rules_for_iface را هم تضمین می‌کند
+                        base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
+                        v4i, v6i = sni_index.get_ips_for_base(base)
+                        rec["realized"]["v4"] = sorted(set(rec["realized"].get("v4", [])) | set(v4i))
+                        rec["realized"]["v6"] = sorted(set(rec["realized"].get("v6", [])) | set(v6i))
+                        with self.lock:
+                            self.items[fid] = rec
+                            self.flush()
+                        try: _sync_registry_for(fid)
+                        except Exception: pass
+                        try: blocksreg.upsert_from_rec(rec)
+                        except Exception: pass
+                    except Exception as e:
+                        print("[netdash] preseed per-iface failed:", e)
+
+                # 4) preseed برای آیتم‌های global
+                if SNI_INDEX_PRESEED_ON_ADD and not iface:
                     try:
                         _preseed_ipset_from_index(pat, show_page)
                         base = _registrable_domain(pat) or _normalize_domain_or_none(pat) or pat.strip().lower().strip(".")
@@ -1831,58 +1946,53 @@ class FilterStore:
                         with self.lock:
                             self.items[fid] = rec
                             self.flush()
-                        try:
-                            _sync_registry_for(fid)
-                        except Exception:
-                            pass
-                                                    
-                        try:
-                            blocksreg.upsert_from_rec(rec)
-                        except Exception:
-                            pass
-                                                
+                        try: _sync_registry_for(fid)
+                        except Exception: pass
+                        try: blocksreg.upsert_from_rec(rec)
+                        except Exception: pass
                     except Exception as e:
                         print("[netdash] preseed from index failed:", e)
-            
-                # 3) (در صورت فعال بودن) یک بار قوانین SNI را اضافه کن
+
+                # 5) قوانین SNI (هم برای global هم per-iface)
                 if SNI_BLOCK_ENABLED:
-                    rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
-                    with self.lock:
-                        self.items[fid] = rec
-                        self.flush()
                     try:
-                        blocksreg.upsert_from_rec(rec)
-                    except Exception:
-                        pass
-                    try:
-                        _sync_registry_for(fid)
-                    except Exception:
-                        pass
-                                
+                        rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
+                        with self.lock:
+                            self.items[fid] = rec
+                            self.flush()
+                        try: blocksreg.upsert_from_rec(rec)
+                        except Exception: pass
+                        try: _sync_registry_for(fid)
+                        except Exception: pass
+                    except Exception as e:
+                        print(f"[netdash] SNI add failed for {pat}: {e}")
+
                 return rec
 
+            # --- IP/CIDR → مستقیم ipset (با حمایت per-interface در صورت وجود iface) ---
+            if iface:
+                ensure_ipset_and_rules_for_iface(iface, show_page)
+            s4, s6 = _ipset_names_for(rec)
 
-            # IP/CIDR → مستقیم به ipset
             if fam == 'v4':
-                setname = (IPSET4P if (show_page and PAGE_MODE_ENABLED) else IPSET4)
-                _run_root(["ipset","add", setname, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
-                rec["realized"]["v4"].append(pat)
-            elif fam == 'v6':
-                setname = (IPSET6P if (show_page and PAGE_MODE_ENABLED) else IPSET6)
-                _run_root(["ipset","add", setname, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
-                rec["realized"]["v6"].append(pat)
+                _run_root(["ipset", "add", s4, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                rec["realized"]["v4"] = [pat]
+            else:  # fam == 'v6'
+                _run_root(["ipset", "add", s6, pat, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                rec["realized"]["v6"] = [pat]
 
             with self.lock:
                 self.items[fid] = rec
                 self.flush()
+
             try:
                 blocksreg.upsert_from_rec(rec)
-            except Exception:
-                pass
-                            
+            except Exception as e:
+                print("[netdash] blocksreg upsert (ip/cidr) failed:", e)
+
             return rec
 
-        # ---- fallback: iptables per-IP (legacy) ----
+        # ---- حالت legacy: iptables per-IP ----
         rules = []
         chains = ["OUTPUT", "FORWARD"]
         if fam is None:
@@ -1918,12 +2028,13 @@ class FilterStore:
             raise RuntimeError("هیچ قانون iptables/ip6tables اعمال نشد.")
         rec["rules"] = rules
         rec["realized"] = {"v4": v4, "v6": v6}
+
         if SNI_BLOCK_ENABLED and fam is None:
             try:
                 rec["sni_rules"] = _add_sni_rules_for_domain(pat, iface=iface)
             except Exception:
                 pass
-                
+
         with self.lock:
             self.items[fid] = rec
             self.flush()
@@ -1931,8 +2042,7 @@ class FilterStore:
             blocksreg.upsert_from_rec(rec)
         except Exception as e:
             print("[netdash] blocksreg upsert (legacy) failed:", e)
-            
-            
+
         return rec
 
     def _apply_one(self, dst, iface, proto, port, chain, ipv6):
@@ -1966,17 +2076,27 @@ class FilterStore:
         if USE_DNSMASQ_IPSET:
             # --- دامنه ---
             if fam is None:
+                # حذف از حافظه + بازسازی dnsmasq
                 with self.lock:
                     self.items.pop(fid, None)
                     self.flush()
 
                 _rebuild_dnsmasq_conf_from_items(self.items)
 
+                # اگر per-interface بود، ست مخصوص همان iface را هم پاک کن
+                try:
+                    if (rec or {}).get("iface"):
+                        _del_domain_from_iface_sets(rec)
+                except Exception as e:
+                    print("[netdash] per-iface purge warn:", e)
+
+                # پاکسازی امن از ست‌های سراسری (اگر دیگر لازم نباشند)
                 try:
                     _del_domain_everywhere_safe(rec)
                 except Exception as e:
                     print("[netdash] safe-del warn:", e)
 
+                # اگر دیگر دامنه‌ای نداریم، ست‌های سراسری را flush کن
                 any_domains = False
                 with self.lock:
                     for rr in self.items.values():
@@ -1986,7 +2106,7 @@ class FilterStore:
                 if not any_domains:
                     _flush_all_ipsets()
 
-                # ←← حذف از رجیستر
+                # حذف از رجیستری
                 try:
                     blocksreg.remove(fid)
                 except Exception as e:
@@ -1995,18 +2115,18 @@ class FilterStore:
                 return True
 
             # --- IP/CIDR ---
-            setname = None
+            s4, s6 = _ipset_names_for(rec)
             if fam == 'v4':
-                setname = IPSET4P if rec.get("show_page") else IPSET4
+                try: _run_root(["ipset", "del", s4, pat])
+                except Exception: pass
             elif fam == 'v6':
-                setname = IPSET6P if rec.get("show_page") else IPSET6
-            if setname:
-                _run_root(["ipset","del", setname, pat])
+                try: _run_root(["ipset", "del", s6, pat])
+                except Exception: pass
+
             with self.lock:
                 self.items.pop(fid, None)
                 self.flush()
 
-            # ←← حذف از رجیستر
             try:
                 blocksreg.remove(fid)
             except Exception as e:
@@ -2019,19 +2139,20 @@ class FilterStore:
             cmd = r.get("cmd") or []
             dcmd = _del_equivalent(cmd)
             if _run_root(dcmd) != 0:
-                base = [c for c in dcmd if c not in ("sudo","-n")]
+                base = [c for c in dcmd if c not in ("sudo", "-n")]
                 _run_root(base)
         with self.lock:
             self.items.pop(fid, None)
             self.flush()
 
-        # ←← حذف از رجیستر
         try:
             blocksreg.remove(fid)
         except Exception as e:
             print("[netdash] blocksreg remove (legacy) failed:", e)
 
         return True
+
+
 
 
 
@@ -2064,21 +2185,21 @@ class SNILearner:
         try:
             from scapy.layers.inet import TCP, IP
             from scapy.layers.inet6 import IPv6
-
+    
             if not pkt.haslayer(TCP):
                 return
             tcp = pkt[TCP]
             if tcp.dport != 443:
                 return
-
+    
             payload = bytes(tcp.payload or b"")
             if not payload:
                 return
-
+    
             host = _extract_sni_from_clienthello(payload)
             if not host:
                 return
-
+    
             # v4/v6 و مقصد
             if IP in pkt:
                 fam, dst_ip = "v4", pkt[IP].dst
@@ -2086,29 +2207,63 @@ class SNILearner:
                 fam, dst_ip = "v6", pkt[IPv6].dst
             else:
                 return
-
+    
             iface_name = getattr(pkt, "sniffed_on", None)
-
-            # لاگ و ایندکس
+    
+            # لاگ خام + ایندکس
             _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam, base=None, iface=iface_name)
             sni_index.update(host, dst_ip, fam, iface=iface_name)
-
-            # اگر زیرمجموعه یکی از دامنه‌های مسدود نیست، تمام
+    
+            # آیا زیرمجموعهٔ دامنهٔ بلاک‌شده است؟
             rec = self._match_any_blocked(host)
             if not rec:
                 return
-
-            # برای ردیابی، با base هم لاگ کن
+    
+            # لاگ match
             _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam, base=rec.get("pattern"), iface=iface_name)
-
-            # ددیوب کوتاه‌مدت
+    
+            # --- DEDUPE ---
+            iface_target = (rec.get("iface") or None)  # per-interface؟
+            dedupe_key = (fam, dst_ip, iface_target or "GLOBAL")
             now = time.time()
-            key = (fam, dst_ip)
-            if now - self._recent.get(key, 0) < self._recent_ttl:
+            last = self._recent.get(dedupe_key)
+            if last and (now - last) < self._recent_ttl:
                 return
-            self._recent[key] = now
-
-            # انتخاب ست درست
+            self._recent[dedupe_key] = now
+    
+            keyfam = "v4" if fam == "v4" else "v6"
+    
+            if iface_target:
+                # --- per-interface ---
+                ensure_ipset_and_rules_for_iface(iface_target, bool(rec.get("show_page")))
+                set4, set6 = _ipset_names_for(rec)
+                try:
+                    if fam == "v4":
+                        _run_root(["ipset", "add", set4, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                    else:
+                        _run_root(["ipset", "add", set6, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                    print(f"[netdash] SNI-add(per-iface): {dst_ip} -> {(set4 if fam=='v4' else set6)}  host={host}  iface={iface_target}")
+                except Exception:
+                    pass
+    
+                # realized/registry
+                try:
+                    with filters.lock:
+                        rr = filters.items.get(rec["id"])
+                        if rr:
+                            arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
+                            if dst_ip not in arr:
+                                arr.append(dst_ip)
+                        filters.flush()
+                except Exception:
+                    pass
+                try: _sync_registry_for(rec["id"])
+                except Exception: pass
+                try: blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
+                except Exception: pass
+                return
+    
+            # --- GLOBAL ---
             use_page = bool(rec.get("show_page") and PAGE_MODE_ENABLED)
             setname = {
                 ("v4", False): IPSET4,
@@ -2116,14 +2271,10 @@ class SNILearner:
                 ("v4", True):  IPSET4P,
                 ("v6", True):  IPSET6P,
             }[(fam, use_page)]
-
-            # افزودن به ipset
+    
             _run_root(["ipset", "add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
             print(f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
-
-
-            # برای UI: realized را آپدیت کن
-            keyfam = "v4" if fam == "v4" else "v6"
+    
             try:
                 with filters.lock:
                     rr = filters.items.get(rec["id"])
@@ -2134,18 +2285,43 @@ class SNILearner:
                     filters.flush()
             except Exception:
                 pass
+            try: _sync_registry_for(rec["id"])
+            except Exception: pass
+            try: blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
+            except Exception: pass
+    
+        except Exception as e:
+            print("[netdash] SNI learner error:", e)
 
-            # همون لحظه رجیستری را دقیقاً بر اساس realized آپدیت کن
+
+            
+            # ----- حالت GLOBAL قدیمی (مثل قبل) -----
+            use_page = bool(rec.get("show_page") and PAGE_MODE_ENABLED)
+            setname = {
+                ("v4", False): IPSET4,
+                ("v6", False): IPSET6,
+                ("v4", True):  IPSET4P,
+                ("v6", True):  IPSET6P,
+            }[(fam, use_page)]
+            
+            _run_root(["ipset", "add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+            print(f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
+            
             try:
-                _sync_registry_for(rec["id"])
+                with filters.lock:
+                    rr = filters.items.get(rec["id"])
+                    if rr:
+                        arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
+                        if dst_ip not in arr:
+                            arr.append(dst_ip)
+                    filters.flush()
             except Exception:
                 pass
+            try: _sync_registry_for(rec["id"])
+            except Exception: pass
+            try: blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
+            except Exception: pass
 
-            # برای اطمینان، IP تک‌به‌تک را هم به رجیستری اضافه کن (اگر قبلاً نبود)
-            try:
-                blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
-            except Exception as e:
-                print("[netdash] blocksreg add_realized_ip failed:", e)
 
                 
         except Exception as e:
