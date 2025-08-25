@@ -52,34 +52,38 @@ HOST ="0.0.0.0"
 PORT =int (os .environ .get ("NETDASH_PORT","18080"))
 BLOCK_PORT =int (os .environ .get ("NETDASH_BLOCK_PORT","18081"))
 FLUSH_SETS_ON_REMOVE =os .environ .get ("NETDASH_FLUSH_SETS_ON_REMOVE","1").lower ()in ("1","true","yes","on")
-
 ENABLE_PAGE_MODE =os .environ .get ("NETDASH_ENABLE_PAGE_MODE","0").lower ()in ("1","true","yes","on")
-
 USE_DNSMASQ_IPSET =os .environ .get ("NETDASH_IPSET_MODE","1").lower ()in ("1","true","yes","on")
 SNI_BLOCK_ENABLED =os .environ .get ("NETDASH_SNI_BLOCK","1").lower ()in ("1","true","yes","on")
 PAGE_MODE_ENABLED =os .environ .get ("NETDASH_PAGE_MODE","1").lower ()in ("1","true","yes","on")
 SNI_LEARN_ENABLED =os .environ .get ("NETDASH_SNI_LEARN","1").lower ()in ("1","true","yes","on")
-
 AUTO_ENFORCE_DNS =os .environ .get ("NETDASH_ENFORCE_DNS","1").lower ()in ("1","true","yes","on")
 AUTO_BLOCK_DOT =os .environ .get ("NETDASH_BLOCK_DOT","0").lower ()in ("1","true","yes","on")
-
 AUTO_PRELOAD_META =os .environ .get ("NETDASH_PRELOAD_META","0").lower ()in ("1","true","yes","on")
-
 AUTO_PIP_INSTALL =os .environ .get ("NETDASH_AUTO_PIP","1").lower ()in ("1","true","yes","on")
-
 SNI_LEARN_IFACES =[x .strip ()for x in os .environ .get ("NETDASH_SNI_IFACES","").split (",")if x .strip ()]
-
 CONTROL_ENABLED =True 
 CONTROL_TOKEN =os .environ .get ("NETDASH_TOKEN","").strip ()
 DENY_IFACES ={x .strip ()for x in os .environ .get ("NETDASH_DENY","").split (",")if x .strip ()}
 ALLOW_IFACES ={x .strip ()for x in os .environ .get ("NETDASH_ALLOW","").split (",")if x .strip ()}
-
 IPSET4 =os .environ .get ("NETDASH_IPSET4","nd-bl4")
 IPSET6 =os .environ .get ("NETDASH_IPSET6","nd-bl6")
 IPSET4P =os .environ .get ("NETDASH_IPSET4_PAGE","ndp-bl4")
 IPSET6P =os .environ .get ("NETDASH_IPSET6_PAGE","ndp-bl6")
 IPSET_TIMEOUT =int (os .environ .get ("NETDASH_IPSET_TIMEOUT","3600"))
 DNSMASQ_CONF =os .environ .get ("NETDASH_DNSMASQ_CONF","/etc/dnsmasq.d/netdash-blocks.conf")
+
+
+
+PORTS_MONITOR_ENABLED = os.environ.get("NETDASH_PORTS_MONITOR","1").lower() in ("1","true","yes","on")
+PORTS_POLL_INTERVAL  = float(os.environ.get("NETDASH_PORTS_INTERVAL","1.0"))
+
+
+
+
+
+
+
 
 app =Flask (__name__ )
 
@@ -927,8 +931,174 @@ class PingMonitor :
                 out [t ]={"avg":avg ,"p95":p95 ,"max":mx ,"loss":loss ,"n":len (arr )}
         return out 
 
+
 pingmon =PingMonitor ()
 pingmon .start ()
+
+
+def _conntrack_acct_enabled() -> bool:
+    try:
+        with open("/proc/sys/net/netfilter/nf_conntrack_acct","r") as f:
+            return f.read().strip() == "1"
+    except Exception:
+        return False
+
+def _enable_conntrack_acct_if_possible():
+    if _conntrack_acct_enabled():
+        return
+    # تلاش ملایم برای فعال‌سازی
+    try:
+        cmd = ["sysctl","-w","net.netfilter.nf_conntrack_acct=1"]
+        if os.geteuid()!=0: cmd = ["sudo","-n"] + cmd
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def _conntrack_lines():
+    cmd = ["conntrack","-L","-o","extended"]
+    if os.geteuid()!=0: cmd = ["sudo","-n"] + cmd
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=3.5)
+        return out.splitlines()
+    except Exception:
+        return []
+
+
+
+
+class PortsMonitor:
+    """
+    جمع‌آوری از conntrack و تجمیع بر اساس (proto, dport)
+    rx_bps: reply bytes/sec ~ دانلود | tx_bps: orig bytes/sec ~ آپلود
+    """
+    def __init__(self, interval=1.0, max_ports=1000):
+        self.interval = float(interval)
+        self.prev_flows = {}  # (proto,src,sport,dst,dport) -> (orig_bytes, reply_bytes, t)
+        self.totals = {}      # (proto,port) -> {"rx_total":int, "tx_total":int}
+        self.rates  = {}      # (proto,port) -> {"rx_bps":float,"tx_bps":float,"flows":int}
+        self.lock = threading.Lock()
+        self.running = False
+        self.max_ports = max_ports
+
+    def _parse(self, line):
+        try:
+            parts = line.strip().split()
+            if not parts: return None
+            proto = parts[0].lower()
+            orig = {"src":None,"dst":None,"sport":None,"dport":None}
+            reply= {"src":None,"dst":None,"sport":None,"dport":None}
+            stage="orig"; need={"src","dst","sport","dport"}; have=set()
+            i=1
+            while i<len(parts):
+                tok=parts[i]
+                if tok.startswith("src="):
+                    (orig if stage=="orig" else reply)["src"]=tok[4:]; have.add("src")
+                elif tok.startswith("dst="):
+                    (orig if stage=="orig" else reply)["dst"]=tok[4:]; have.add("dst")
+                elif tok.startswith("sport="):
+                    (orig if stage=="orig" else reply)["sport"]=tok[6:]; have.add("sport")
+                elif tok.startswith("dport="):
+                    (orig if stage=="orig" else reply)["dport"]=tok[6:]; have.add("dport")
+                    if stage=="orig" and have>=need:
+                        stage="reply"; have=set()
+                i+=1
+            ob = rb = None; seen=0
+            for tok in parts:
+                if tok.startswith("bytes="):
+                    v=int(tok.split("=",1)[1])
+                    if seen==0: ob=v
+                    elif seen==1: rb=v
+                    seen+=1
+            if not orig["dport"]: return None
+            dport = int(orig["dport"])
+            if ob is None: ob=0
+            if rb is None: rb=0
+            flow_key=(proto, orig["src"], orig["sport"], orig["dst"], str(dport))
+            port_key=(proto, dport)
+            return flow_key, port_key, ob, rb
+        except Exception:
+            return None
+
+    def _loop(self):
+        while self.running:
+            t1=time.time()
+            lines=_conntrack_lines(); now=time.time()
+            from collections import defaultdict
+            port_rx=defaultdict(int); port_tx=defaultdict(int); port_flows=defaultdict(int)
+            new_prev={}
+            for ln in lines:
+                parsed=self._parse(ln)
+                if not parsed: continue
+                fkey, pkey, ob, rb = parsed
+                port_flows[pkey]+=1
+                old=self.prev_flows.get(fkey)
+                if not old:
+                    new_prev[fkey]=(ob,rb,now); continue
+                ob0,rb0,t0=old
+                dob = ob - ob0 if ob >= ob0 else ob
+                drb = rb - rb0 if rb >= rb0 else rb
+                port_tx[pkey]+=max(0,dob)
+                port_rx[pkey]+=max(0,drb)
+                new_prev[fkey]=(ob,rb,now)
+            with self.lock:
+                self.prev_flows=new_prev
+                self.rates.clear()
+                for pkey in set(list(port_rx.keys())+list(port_tx.keys())):
+                    rx_bps = port_rx[pkey] / max(1e-6, self.interval)
+                    tx_bps = port_tx[pkey] / max(1e-6, self.interval)
+                    self.rates[pkey]={"rx_bps":rx_bps,"tx_bps":tx_bps,"flows":port_flows.get(pkey,0)}
+                    tot=self.totals.setdefault(pkey,{"rx_total":0,"tx_total":0})
+                    tot["rx_total"]+=port_rx[pkey]
+                    tot["tx_total"]+=port_tx[pkey]
+            elapsed=time.time()-t1
+            time.sleep(max(0.0, self.interval - elapsed))
+
+    def start(self):
+        if self.running: return
+        _enable_conntrack_acct_if_possible()
+        self.running=True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def snapshot(self):
+        with self.lock:
+            rows=[]
+            for (proto, port), r in self.rates.items():
+                tot=self.totals.get((proto,port),{"rx_total":0,"tx_total":0})
+                rows.append({
+                    "proto":proto,"port":port,
+                    "rx_bps":r["rx_bps"],"tx_bps":r["tx_bps"],
+                    "rx_total":tot["rx_total"],"tx_total":tot["tx_total"],
+                    "flows":r["flows"]
+                })
+            rows.sort(key=lambda x:(x["rx_bps"]+x["tx_bps"]), reverse=True)
+            return {"ts": time.time(), "ports": rows[:self.max_ports]}
+
+# instantiate & start
+portsmon = PortsMonitor(interval=PORTS_POLL_INTERVAL)
+if PORTS_MONITOR_ENABLED:
+    try:
+        portsmon.start()
+        print(f"[netdash] Ports monitor started (interval={PORTS_POLL_INTERVAL}s)")
+    except Exception as e:
+        print("[netdash] ports monitor disabled:", e)
+
+# API route
+# قبلی:
+# @app.route("/api/ports/live")
+# def api_ports_live():
+
+# پیشنهادی (endpoint یکتا + اسم تابع جدید):
+@app.route("/api/ports/live", endpoint="ports_live_api")
+def api_ports_live_view():
+    if not PORTS_MONITOR_ENABLED:
+        return jsonify({"ok": False, "reason": "disabled"}), 503
+    try:
+        return jsonify(portsmon.snapshot())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
 
 def _run_root (cmd ):
     c =cmd [:]
@@ -2274,11 +2444,18 @@ HTML =r"""
   <div class="max-w-7xl mx-auto p-4 sm:p-6">
     <div class="flex flex-wrap items-center justify-between gap-3 mb-6">
       <h1 class="text-2xl sm:text-3xl font-extrabold">NetDash</h1>
-      <div class="grid grid-cols-[1fr_auto] items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
         <input id="filterInput" class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" placeholder="فیلتر اینترفیس‌ها...">
         <button id="darkBtn" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">تیره / روشن</button>
+      
+        <!-- دکمهٔ چندرنگ پورت‌ها -->
+        <button id="portsBtn" class="px-3 py-2 rounded-xl text-sm text-white bg-gradient-to-r from-indigo-500 via-fuchsia-500 to-emerald-500 shadow hover:opacity-90">
+          پورت‌ها
+        </button>
+      
         <select id="statSel" class="px-2 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" title="پنجره آماری"></select>
       </div>
+
 
     </div>
 
@@ -2396,8 +2573,9 @@ HTML =r"""
   </template>
 
   <!-- Modal محدودیت -->
+
   <div id="shape-modal" class="fixed inset-0 z-50 hidden">
-    <div class="absolute inset-0 bg-black/40"></div>
+    <div class="absolute inset-0 bg-black/40" id="shape-overlay"></div>
     <div class="absolute inset-0 flex items-center justify-center p-4">
       <div class="w-full max-w-md card bg-white dark:bg-gray-800 p-4 rounded-xl">
         <div class="flex items-center justify-between mb-2">
@@ -2423,8 +2601,44 @@ HTML =r"""
       </div>
     </div>
   </div>
+  <!-- Modal پورت‌ها (فقط یک‌بار) -->
+  <div id="ports-modal" class="fixed inset-0 z-50 hidden">
+    <div class="absolute inset-0 bg-black/40" id="ports-overlay"></div>
+    <div class="absolute inset-0 flex items-center justify-center p-4">
+      <div class="w-full max-w-3xl card bg-white dark:bg-gray-800 p-4 rounded-xl">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-bold">ترافیک زنده بر اساس پورت</h3>
+          <button id="ports-close" class="text-sm opacity-70">✕</button>
+        </div>
+        <div class="text-xs opacity-70 mb-3">منبع داده: conntrack (kernel)</div>
+        <div class="overflow-auto max-h-[70vh]">
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left opacity-70">
+                <th class="py-1 pr-4">Proto</th>
+                <th class="py-1 pr-4">Port</th>
+                <th class="py-1 pr-4">دانلود (Mbps)</th>
+                <th class="py-1 pr-4">آپلود (Mbps)</th>
+                <th class="py-1 pr-4">دانلود کل</th>
+                <th class="py-1 pr-4">آپلود کل</th>
+                <th class="py-1 pr-4">جریان‌ها</th>
+              </tr>
+            </thead>
+            <tbody id="ports-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+  
+  
+
+
 
   <!-- اسکریپت یکپارچه -->
+
   <script>
     // اگر Chart.js نبود، مینی‌چارت ساده بساز
     (function ensureChart(){
@@ -2467,6 +2681,36 @@ HTML =r"""
       while(v>=1024 && i<units.length-1){ v/=1024; i++; }
       return v.toFixed(v<10?2:1)+" "+units[i];
     }
+    
+    function fmtMbps(bps){
+      const mbps = (Number(bps) * 8) / 1e6; // bps→Mbps (اینجا ورودی بایت بر ثانیه است)
+      return mbps.toFixed(mbps<10?2:1);
+    }
+    
+    async function refreshPorts(){
+      try{
+        const res = await fetch('/api/ports/live', {cache:'no-store'});
+        if(!res.ok) return;
+        const data = await res.json();
+        const tbody = document.getElementById('ports-tbody');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        for(const row of (data.ports || [])){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td class="py-1 pr-4 k">${String(row.proto||'').toUpperCase()}</td>
+            <td class="py-1 pr-4 k">${row.port}</td>
+            <td class="py-1 pr-4 k">${((row.rx_bps||0)*8/1e6).toFixed(2)}</td>
+            <td class="py-1 pr-4 k">${((row.tx_bps||0)*8/1e6).toFixed(2)}</td>
+            <td class="py-1 pr-4 k">${fmtBytes(row.rx_total||0)}</td>
+            <td class="py-1 pr-4 k">${fmtBytes(row.tx_total||0)}</td>
+            <td class="py-1 pr-4 k">${row.flows||0}</td>`;
+          tbody.appendChild(tr);
+        }
+      }catch(e){}
+    }
+    
+    
     function badgeFor(state){
       state = (state||"").toUpperCase();
       if(state==="UP") return {text:"فعال", cls:"badge b-up"};
@@ -2542,9 +2786,9 @@ HTML =r"""
     // اعمال دوباره‌ی فیلتر روی کارت‌های تازه‌ساخته‌شده
     const fi = document.getElementById('filterInput');
     if (fi) fi.dispatchEvent(new Event('input'));
-
     // ---------- Modal handlers ----------
     let SHAPE_IFACE = null;
+    
     function openShapeModal(iface, detail){
       try{
         SHAPE_IFACE = iface;
@@ -2559,12 +2803,32 @@ HTML =r"""
       }catch(e){}
     }
     function closeShapeModal(){
-      try{ document.getElementById('shape-modal').classList.add('hidden'); SHAPE_IFACE = null; }catch(e){}
+      try{
+        document.getElementById('shape-modal').classList.add('hidden');
+        SHAPE_IFACE = null;
+      }catch(e){}
     }
+    
+    function openPortsModal(){
+      try{
+        document.getElementById('ports-modal').classList.remove('hidden');
+        refreshPorts();                 // اولی
+        window.__portsTimer = setInterval(refreshPorts, 1000);  // آپدیت هر ثانیه
+      }catch(e){}
+    }
+    function closePortsModal(){
+      try{
+        document.getElementById('ports-modal').classList.add('hidden');
+        if (window.__portsTimer){ clearInterval(window.__portsTimer); window.__portsTimer = null; }
+      }catch(e){}
+    }
+    
     function bindShapeModalHandlers(){
       const closeBtn = document.getElementById('shape-close');
+      const overlay  = document.getElementById('shape-overlay');
       if (closeBtn) closeBtn.onclick = closeShapeModal;
-
+      if (overlay)  overlay.onclick  = closeShapeModal;
+    
       const applyBtn = document.getElementById('shape-apply');
       if (applyBtn) applyBtn.onclick = async ()=>{
         const rate = parseFloat(String(document.getElementById('shape-rate').value).replace(',','.'));
@@ -2572,27 +2836,40 @@ HTML =r"""
         const dir = document.querySelector('input[name="shape-dir"]:checked').value;
         const headers = Object.assign({"Content-Type":"application/json"}, CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {});
         try{
-          const res = await fetch(`/api/shape/${encodeURIComponent(SHAPE_IFACE)}/limit`, { method:'POST', headers, body: JSON.stringify({rate_mbit: rate, direction: dir}) });
+          const res = await fetch(`/api/shape/${encodeURIComponent(SHAPE_IFACE)}/limit`, {
+            method:'POST', headers, body: JSON.stringify({rate_mbit: rate, direction: dir})
+          });
           if(!res.ok){ alert('خطا در اعمال محدودیت'); return; }
           closeShapeModal();
           if (typeof loadInterfaces==='function') await loadInterfaces();
         }catch(e){ alert('خطا: '+e); }
       };
-
+    
       const clearBtn = document.getElementById('shape-clear');
       if (clearBtn) clearBtn.onclick = async ()=>{
         const dir = document.querySelector('input[name="shape-dir"]:checked').value;
         const headers = Object.assign({"Content-Type":"application/json"}, CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {});
         try{
-          const res = await fetch(`/api/shape/${encodeURIComponent(SHAPE_IFACE)}/clear`, { method:'POST', headers, body: JSON.stringify({direction: dir}) });
+          const res = await fetch(`/api/shape/${encodeURIComponent(SHAPE_IFACE)}/clear`, {
+            method:'POST', headers, body: JSON.stringify({direction: dir})
+          });
           if(!res.ok){ alert('خطا در حذف محدودیت'); return; }
           closeShapeModal();
           if (typeof loadInterfaces==='function') await loadInterfaces();
         }catch(e){ alert('خطا: '+e); }
       };
     }
-
+    
+    function bindPortsModalHandlers(){
+      const openBtn  = document.getElementById('portsBtn');
+      const closeBtn = document.getElementById('ports-close');
+      const overlay  = document.getElementById('ports-overlay');
+      if (openBtn)  openBtn.onclick  = openPortsModal;
+      if (closeBtn) closeBtn.onclick = closePortsModal;
+      if (overlay)  overlay.onclick  = closePortsModal;
+    }
     // ---------- API/UI logic ----------
+
     function initStatWindowSelector(){
       const sel = document.getElementById('statSel');
       if (!sel) return;
@@ -2892,9 +3169,16 @@ HTML =r"""
 
     // ---------- Init & events ----------
     window.addEventListener('load', ()=>{
-      // UI init
-      initStatWindowSelector();
       bindShapeModalHandlers();
+      bindPortsModalHandlers();
+    
+      initStatWindowSelector();
+      populateFilterIfaces();
+      loadInterfaces();
+      loadHistory();
+      updatePing();
+      setInterval(tick, 1000);
+    });
 
       // Filter events
       try{
@@ -2924,6 +3208,11 @@ HTML =r"""
           }, {passive:true});
         }
       })();
+      const portsBtn = document.getElementById('portsBtn');
+      if (portsBtn) portsBtn.addEventListener('click', openPortsModal, {passive:true});
+      
+      const portsClose = document.getElementById('ports-close');
+      if (portsClose) portsClose.addEventListener('click', closePortsModal, {passive:true});
 
 
       // Live data
@@ -2938,12 +3227,52 @@ HTML =r"""
         updatePing();
 
       })();
+
+
+    window.addEventListener('load', ()=>{
+      // بایند مودال‌ها
+      bindShapeModalHandlers();
+      bindPortsModalHandlers();
+    
+      // اینیت‌های صفحه (اگر قبلاً نداشتی)
+      initStatWindowSelector();
+      populateFilterIfaces();
+      loadInterfaces();
+      loadHistory();
+      updatePing();
+      setInterval(tick, 1000);
     });
+
+
 
   </script>
 </body>
 </html>
 """
+
+
+
+
+
+
+@app.route("/api/ports/live")
+def api_ports_live():
+    if not PORTS_MONITOR_ENABLED:
+        return jsonify({"ok": False, "reason": "disabled"}), 503
+    try:
+        snap = portsmon.snapshot()
+        return jsonify(snap)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+if PORTS_MONITOR_ENABLED:
+    portsmon.start()
+
+
+
+
 
 @app .route ("/api/debug/sync-registry-now",methods =["POST"])
 def api_debug_sync_now ():
@@ -3137,6 +3466,9 @@ def _flush_on_exit ():
 if __name__ =="__main__":
     try :
         monitor .start ()
+        if PORTS_MONITOR_ENABLED:
+            portsmon.start()
+                
         start_block_server ()
         sni_learner =SNILearner (ifaces =SNI_LEARN_IFACES or None )
         sni_learner .start ()
