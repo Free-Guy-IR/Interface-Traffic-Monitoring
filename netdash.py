@@ -1055,10 +1055,12 @@ def _ensure_dns_redirection ():
             v6 =True 
             )
 
-def _ensure_block_dot ():
-    for v6 in (False ,True ):
+def _ensure_block_dot():
+    for v6 in (False, True):
         for ch in ("OUTPUT","FORWARD"):
-            _ipt_ensure ([ch ,"-p","tcp","--dport","853","-j","REJECT"],v6 =v6 )
+            _ipt_ensure([ch,"-p","tcp","--dport","853","-j","REJECT"], v6=v6)
+            _ipt_ensure([ch,"-p","udp","--dport","8853","-j","REJECT"], v6=v6)  # DoQ
+
 
 DEFAULT_BLOCKS =[
 
@@ -1894,190 +1896,197 @@ class FilterStore :
 
         return True 
 
-class SNILearner :
-    def __init__ (self ,ifaces =None ):
-        self .ifaces =list (ifaces )if ifaces else None 
-        self .running =False 
-        self ._recent ={}
-        self ._recent_ttl =60.0 
-    def _match_any_blocked (self ,host ):
-        try :
-            with filters .lock :
-                for rec in filters .items .values ():
-                    pat =(rec or {}).get ("pattern","").strip ()
-                    if not pat or _split_family (pat )is not None :
-                        continue 
-                    if _hostname_matches (host ,pat ):
-                        return rec 
-        except Exception :
-            pass 
-        return None 
+class SNILearner:
+    def __init__(self, ifaces=None):
+        self.ifaces = list(ifaces) if ifaces else None
+        self.running = False
+        self._recent = {}
+        self._recent_ttl = 60.0
+        # بافر ساده برای سرجمع‌کردن اولین بایت‌های TLS هر جریان
+        # کلید: (v6?, src, dst, sport, dport)
+        self._bufs = {}
+        self._buf_limit = 4096  # فقط برای ClientHello کافی است
 
-    def _handle_packet (self ,pkt ):
-        try :
-            from scapy .layers .inet import TCP ,IP 
-            from scapy .layers .inet6 import IPv6 
+    def _match_any_blocked(self, host):
+        try:
+            with filters.lock:
+                for rec in filters.items.values():
+                    pat = (rec or {}).get("pattern", "").strip()
+                    if not pat or _split_family(pat) is not None:
+                        continue
+                    if _hostname_matches(host, pat):
+                        return rec
+        except Exception:
+            pass
+        return None
 
-            if not pkt .haslayer (TCP ):
-                return 
-            tcp =pkt [TCP ]
-            if tcp .dport !=443 :
-                return 
+    def _key_for_pkt(self, pkt, IP, IPv6, TCP):
+        try:
+            if IP in pkt:
+                l3 = pkt[IP]; v6 = False
+            elif IPv6 in pkt:
+                l3 = pkt[IPv6]; v6 = True
+            else:
+                return None
+            if not pkt.haslayer(TCP):
+                return None
+            tcp = pkt[TCP]
+            return (v6, l3.src, l3.dst, int(tcp.sport), int(tcp.dport))
+        except Exception:
+            return None
 
-            payload =bytes (tcp .payload or b"")
-            if not payload :
-                return 
+    def _consume_clienthello(self, payload):
+        # تلاش برای استخراج SNI از بایت‌های ابتدایی ClientHello
+        return _extract_sni_from_clienthello(payload)
 
-            host =_extract_sni_from_clienthello (payload )
-            if not host :
-                return 
+    def _learn_ip(self, rec, fam, dst_ip, host, iface_name):
+        try:
+            _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam,
+                            base=rec.get("pattern"), iface=iface_name)
+            base_page = bool(rec.get("show_page") and PAGE_MODE_ENABLED)
+            keyfam = "v4" if fam == "v4" else "v6"
 
-            if IP in pkt :
-                fam ,dst_ip ="v4",pkt [IP ].dst 
-            elif IPv6 in pkt :
-                fam ,dst_ip ="v6",pkt [IPv6 ].dst 
-            else :
-                return 
+            if rec.get("iface"):
+                ensure_ipset_and_rules_for_iface(rec["iface"], base_page)
+                set4, set6 = _ipset_names_for(rec)
+                try:
+                    if fam == "v4":
+                        _run_root(["ipset", "add", set4, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                    else:
+                        _run_root(["ipset", "add", set6, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                    print(f"[netdash] SNI-add(per-iface): {dst_ip} -> {(set4 if fam=='v4' else set6)}  host={host}  iface={rec.get('iface')}")
+                except Exception:
+                    pass
+            else:
+                setname = {
+                    ("v4", False): IPSET4,
+                    ("v6", False): IPSET6,
+                    ("v4", True):  IPSET4P,
+                    ("v6", True):  IPSET6P,
+                }[(fam, base_page)]
+                try:
+                    _run_root(["ipset", "add", setname, dst_ip, "timeout", str(IPSET_TIMEOUT), "-exist"])
+                    print(f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
+                except Exception:
+                    pass
 
-            iface_name =getattr (pkt ,"sniffed_on",None )
+            # به‌روزرسانی realized + رجیستری
+            try:
+                with filters.lock:
+                    rr = filters.items.get(rec["id"])
+                    if rr:
+                        arr = rr.setdefault("realized", {}).setdefault(keyfam, [])
+                        if dst_ip not in arr:
+                            arr.append(dst_ip)
+                    filters.flush()
+            except Exception:
+                pass
+            try:
+                _sync_registry_for(rec["id"])
+            except Exception:
+                pass
+            try:
+                blocksreg.add_realized_ip(rec["id"], keyfam, dst_ip)
+            except Exception:
+                pass
+        except Exception as e:
+            print("[netdash] SNI learner (learn_ip) error:", e)
 
-            _append_sni_log (kind ="sni",host =host ,dst_ip =dst_ip ,fam =fam ,base =None ,iface =iface_name )
-            sni_index .update (host ,dst_ip ,fam ,iface =iface_name )
+    def _handle_packet(self, pkt):
+        try:
+            from scapy.layers.inet import TCP, IP
+            from scapy.layers.inet6 import IPv6
 
-            rec =self ._match_any_blocked (host )
-            if not rec :
-                return 
+            if not pkt.haslayer(TCP):
+                return
+            tcp = pkt[TCP]
+            if int(tcp.dport) != 443:
+                return
 
-            _append_sni_log (kind ="sni",host =host ,dst_ip =dst_ip ,fam =fam ,base =rec .get ("pattern"),iface =iface_name )
+            key = self._key_for_pkt(pkt, IP, IPv6, TCP)
+            if not key:
+                return
 
-            iface_target =(rec .get ("iface")or None )
-            dedupe_key =(fam ,dst_ip ,iface_target or "GLOBAL")
-            now =time .time ()
-            last =self ._recent .get (dedupe_key )
-            if last and (now -last )<self ._recent_ttl :
-                return 
-            self ._recent [dedupe_key ]=now 
+            # تجمیع بارِ TCP برای گرفتن ClientHello کامل
+            payload = bytes(tcp.payload or b"")
+            if not payload:
+                return
+            buf = self._bufs.get(key, b"") + payload
+            if len(buf) > self._buf_limit:
+                buf = buf[:self._buf_limit]
+            self._bufs[key] = buf
 
-            keyfam ="v4"if fam =="v4"else "v6"
+            host = self._consume_clienthello(buf)
+            if not host:
+                # هنوز به اندازه کافی داده نداریم
+                return
 
-            if iface_target :
+            # به محض یافتن SNI دیگر نیازی به بافر این جریان نیست
+            try:
+                del self._bufs[key]
+            except KeyError:
+                pass
 
-                ensure_ipset_and_rules_for_iface (iface_target ,bool (rec .get ("show_page")))
-                set4 ,set6 =_ipset_names_for (rec )
-                try :
-                    if fam =="v4":
-                        _run_root (["ipset","add",set4 ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
-                    else :
-                        _run_root (["ipset","add",set6 ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
-                    print (f"[netdash] SNI-add(per-iface): {dst_ip} -> {(set4 if fam=='v4' else set6)}  host={host}  iface={iface_target}")
-                except Exception :
-                    pass 
+            if IP in pkt:
+                fam, dst_ip = "v4", pkt[IP].dst
+            elif IPv6 in pkt:
+                fam, dst_ip = "v6", pkt[IPv6].dst
+            else:
+                return
+            iface_name = getattr(pkt, "sniffed_on", None)
 
-                try :
-                    with filters .lock :
-                        rr =filters .items .get (rec ["id"])
-                        if rr :
-                            arr =rr .setdefault ("realized",{}).setdefault (keyfam ,[])
-                            if dst_ip not in arr :
-                                arr .append (dst_ip )
-                        filters .flush ()
-                except Exception :
-                    pass 
-                try :_sync_registry_for (rec ["id"])
-                except Exception :pass 
-                try :blocksreg .add_realized_ip (rec ["id"],keyfam ,dst_ip )
-                except Exception :pass 
-                return 
+            _append_sni_log(kind="sni", host=host, dst_ip=dst_ip, fam=fam, base=None, iface=iface_name)
+            sni_index.update(host, dst_ip, fam, iface=iface_name)
 
-            use_page =bool (rec .get ("show_page")and PAGE_MODE_ENABLED )
-            setname ={
-            ("v4",False ):IPSET4 ,
-            ("v6",False ):IPSET6 ,
-            ("v4",True ):IPSET4P ,
-            ("v6",True ):IPSET6P ,
-            }[(fam ,use_page )]
+            rec = self._match_any_blocked(host)
+            if not rec:
+                return
 
-            _run_root (["ipset","add",setname ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
-            print (f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
+            # dedupe
+            dedupe_key = (fam, dst_ip, (rec.get("iface") or "GLOBAL"))
+            now = time.time()
+            last = self._recent.get(dedupe_key)
+            if last and (now - last) < self._recent_ttl:
+                return
+            self._recent[dedupe_key] = now
 
-            try :
-                with filters .lock :
-                    rr =filters .items .get (rec ["id"])
-                    if rr :
-                        arr =rr .setdefault ("realized",{}).setdefault (keyfam ,[])
-                        if dst_ip not in arr :
-                            arr .append (dst_ip )
-                    filters .flush ()
-            except Exception :
-                pass 
-            try :_sync_registry_for (rec ["id"])
-            except Exception :pass 
-            try :blocksreg .add_realized_ip (rec ["id"],keyfam ,dst_ip )
-            except Exception :pass 
+            self._learn_ip(rec, fam, dst_ip, host, iface_name)
 
-        except Exception as e :
-            print ("[netdash] SNI learner error:",e )
+        except Exception as e:
+            print("[netdash] SNI learner error:", e)
 
-            use_page =bool (rec .get ("show_page")and PAGE_MODE_ENABLED )
-            setname ={
-            ("v4",False ):IPSET4 ,
-            ("v6",False ):IPSET6 ,
-            ("v4",True ):IPSET4P ,
-            ("v6",True ):IPSET6P ,
-            }[(fam ,use_page )]
+    def start(self):
+        if not SNI_LEARN_ENABLED:
+            print("[netdash] SNI learner disabled (NETDASH_SNI_LEARN=0)")
+            return
+        try:
+            from scapy.all import sniff
+        except Exception as e:
+            if AUTO_PIP_INSTALL:
+                try:
+                    import sys, subprocess
+                    subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", "scapy"])
+                    from scapy.all import sniff
+                except Exception as e2:
+                    print("[netdash] SNI learner disabled: scapy install failed:", e2)
+                    return
+            else:
+                print("[netdash] SNI learner disabled: scapy not available:", e)
+                return
 
-            _run_root (["ipset","add",setname ,dst_ip ,"timeout",str (IPSET_TIMEOUT ),"-exist"])
-            print (f"[netdash] SNI-add: {dst_ip} -> {setname}  host={host}  matched={rec.get('pattern')}")
+        self.running = True
+        def run():
+            flt = "tcp dst port 443"
+            kwargs = {"filter": flt, "prn": self._handle_packet, "store": False}
+            if self.ifaces:
+                kwargs["iface"] = self.ifaces
+            print(f"[netdash] SNI learner started on: {self.ifaces or 'ALL'}")
+            try:
+                sniff(**kwargs)
+            except Exception as e:
+                print("[netdash] SNI learner stopped:", e)
+        threading.Thread(target=run, daemon=True).start()
 
-            try :
-                with filters .lock :
-                    rr =filters .items .get (rec ["id"])
-                    if rr :
-                        arr =rr .setdefault ("realized",{}).setdefault (keyfam ,[])
-                        if dst_ip not in arr :
-                            arr .append (dst_ip )
-                    filters .flush ()
-            except Exception :
-                pass 
-            try :_sync_registry_for (rec ["id"])
-            except Exception :pass 
-            try :blocksreg .add_realized_ip (rec ["id"],keyfam ,dst_ip )
-            except Exception :pass 
-
-        except Exception as e :
-            print ("[netdash] SNI learner error:",e )
-
-    def start (self ):
-        if not SNI_LEARN_ENABLED :
-            print ("[netdash] SNI learner disabled (NETDASH_SNI_LEARN=0)")
-            return 
-        try :
-            from scapy .all import sniff 
-        except Exception as e :
-            if AUTO_PIP_INSTALL :
-                try :
-                    import sys ,subprocess 
-                    subprocess .check_call ([sys .executable ,"-m","pip","-q","install","scapy"])
-                    from scapy .all import sniff 
-                except Exception as e2 :
-                    print ("[netdash] SNI learner disabled: scapy install failed:",e2 )
-                    return 
-            else :
-                print ("[netdash] SNI learner disabled: scapy not available:",e )
-                return 
-
-        self .running =True 
-        def run ():
-            flt ="tcp dst port 443"
-            kwargs ={"filter":flt ,"prn":self ._handle_packet ,"store":False }
-            if self .ifaces :
-                kwargs ["iface"]=self .ifaces 
-            print (f"[netdash] SNI learner started on: {self.ifaces or 'ALL'}")
-            try :
-                sniff (**kwargs )
-            except Exception as e :
-                print ("[netdash] SNI learner stopped:",e )
-        threading .Thread (target =run ,daemon =True ).start ()
 
 filters =FilterStore (FILTERS_FILE )
 
@@ -2264,13 +2273,9 @@ HTML =r"""
       <div class="grid grid-cols-[1fr_auto] items-center gap-2">
         <input id="filterInput" class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" placeholder="فیلتر اینترفیس‌ها...">
         <button id="darkBtn" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">تیره / روشن</button>
-        <select id="scopeSel" class="px-2 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm">
-          <option value="daily">روزانه</option>
-          <option value="monthly">ماهانه</option>
-        </select>
         <select id="statSel" class="px-2 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" title="پنجره آماری"></select>
-        <button id="reportBtn" class="px-3 py-2 rounded-xl card bg-white dark:bg-gray-800 text-sm">گزارش</button>
       </div>
+
     </div>
 
     <div id="summary" class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
@@ -2380,7 +2385,6 @@ HTML =r"""
           <div>آپلود <span class="tx-rate font-semibold ltr">0</span></div>
           <div class="opacity-60 text-[11px] mt-1">تجمعی: دانلود <span class="rx-tot ltr">0</span> | آپلود <span class="tx-tot ltr">0</span></div>
           <div class="opacity-70 text-[11px] mt-1 stats ltr"></div>
-          <div class="opacity-70 text-[11px] mt-1 period ltr"></div>
         </div>
       </div>
       <div class="h-36 ltr"><canvas class="chart"></canvas></div>
@@ -2450,8 +2454,7 @@ HTML =r"""
     const cards = new Map();
     let STAT_WINDOW = parseInt(localStorage.getItem('netdash-stat-window') || '60', 10);
     if (isNaN(STAT_WINDOW) || STAT_WINDOW <= 0) STAT_WINDOW = Math.min(60, MAX_POINTS);
-    let LAST_PERIOD = {};   // name -> {rx, tx}
-    let PERIOD_SCOPE = 'daily';
+
 
     // ---------- Utilities ----------
     function fmtBytes(x){
@@ -2498,16 +2501,7 @@ HTML =r"""
       const line = `DL μ/max/۹۵٪: ${dl.mu.toFixed(1)}/${dl.mx.toFixed(1)}/${dl.p95.toFixed(1)} | UL μ/max/۹۵٪: ${ul.mu.toFixed(1)}/${ul.mx.toFixed(1)}/${ul.p95.toFixed(1)} [${W}s]`;
       cardObj.el.querySelector('.stats').textContent = line;
     }
-    function applyPeriodToCards(){
-      const title = (PERIOD_SCOPE==='daily'?'امروز':'ماه جاری');
-      for (const [name, vals] of Object.entries(LAST_PERIOD)){
-        const card = cards.get(name);
-        if(!card) continue;
-        const rx = fmtBytes(vals.rx||0);
-        const tx = fmtBytes(vals.tx||0);
-        card.el.querySelector('.period').textContent = `${title}: DL ${rx} | UL ${tx}`;
-      }
-    }
+
 
     // ---------- Reposition buttons next to badges ----------
     function placeCtrlNextToState(card){
@@ -2541,6 +2535,9 @@ HTML =r"""
     function NetdashPlaceButtons(){
       try{ document.querySelectorAll('.card').forEach(card=>{ placeCtrlNextToState(card); placeShapeNextToState(card); }); }catch(e){}
     }
+    // اعمال دوباره‌ی فیلتر روی کارت‌های تازه‌ساخته‌شده
+    const fi = document.getElementById('filterInput');
+    if (fi) fi.dispatchEvent(new Event('input'));
 
     // ---------- Modal handlers ----------
     let SHAPE_IFACE = null;
@@ -2700,12 +2697,7 @@ HTML =r"""
         wrap.appendChild(card);
 
         // آمار دوره‌ای
-        if (LAST_PERIOD[it.name]){
-          const title = (PERIOD_SCOPE==='daily'?'امروز':'ماه جاری');
-          const rx = fmtBytes(LAST_PERIOD[it.name].rx||0);
-          const tx = fmtBytes(LAST_PERIOD[it.name].tx||0);
-          card.querySelector('.period').textContent = `${title}: DL ${rx} | UL ${tx}`;
-        }
+
 
         // چارت
         let chart;
@@ -2716,6 +2708,9 @@ HTML =r"""
 
       // بعد از رندر کارت‌ها، جای‌گذاری دکمه‌ها
       NetdashPlaceButtons();
+      const fi = document.getElementById('filterInput');
+      if (fi) fi.dispatchEvent(new Event('input'));
+            
     }
 
     async function loadHistory(){
@@ -2791,18 +2786,7 @@ HTML =r"""
       }catch(e){}
     }
 
-    async function loadPeriod(scope){
-      try{
-        const res = await fetch('/api/report/'+scope, {cache:'no-store'});
-        const rep = await res.json();
-        PERIOD_SCOPE = scope;
-        LAST_PERIOD = rep.ifaces || {};
-        applyPeriodToCards();
-        const btn = document.getElementById('reportBtn');
-        const old = btn.textContent; btn.textContent = 'به‌روز شد';
-        setTimeout(()=>btn.textContent = old, 800);
-      } catch(e){}
-    }
+
 
     // Filter فرم‌ها
     async function populateFilterIfaces(){
@@ -2875,6 +2859,33 @@ HTML =r"""
       finally{ btn.textContent=old; btn.removeAttribute('disabled'); }
     }
 
+
+    function bindFilterInput(){
+      const inp = document.getElementById('filterInput');
+      if (!inp) return;
+    
+      const norm = s => String(s||'').toLowerCase().trim();
+    
+      function applyFilter(){
+        const q = norm(inp.value);
+        for (const [name, obj] of cards.entries()){
+          const el = obj.el;
+          const hay = norm([
+            name,
+            el.querySelector('.flags')?.innerText,
+            el.querySelector('.meta')?.innerText,
+            el.querySelector('.addrs')?.innerText,
+            el.querySelector('.linkinfo')?.innerText
+          ].join(' | '));
+          el.style.display = (!q || hay.includes(q)) ? '' : 'none';
+        }
+      }
+    
+      inp.addEventListener('input', applyFilter, {passive:true});
+      // در لود اولیه هم اعمال کن
+      applyFilter();
+    }
+
     // ---------- Init & events ----------
     window.addEventListener('load', ()=>{
       // UI init
@@ -2891,26 +2902,37 @@ HTML =r"""
         setInterval(refreshFilters, 15000);
       }catch(e){}
 
-      // Theme toggle
-      const darkBtn = document.getElementById('darkBtn');
-      function applyTheme(){ const on = localStorage.getItem('netdash-dark') === '1'; document.documentElement.classList.toggle('dark', on); }
-      darkBtn.addEventListener('click', ()=>{ const cur = localStorage.getItem('netdash-dark') === '1'; localStorage.setItem('netdash-dark', cur ? '0' : '1'); applyTheme(); });
-      applyTheme();
+
+      // Theme toggle (robust)
+      (function attachTheme(){
+        function applyTheme(){
+          const on = localStorage.getItem('netdash-dark') === '1';
+          document.documentElement.classList.toggle('dark', on);
+        }
+        applyTheme(); // اعمال در لود
+      
+        const darkBtn = document.getElementById('darkBtn');
+        if (darkBtn) {
+          darkBtn.addEventListener('click', ()=>{
+            const cur = localStorage.getItem('netdash-dark') === '1';
+            localStorage.setItem('netdash-dark', cur ? '0' : '1');
+            applyTheme();
+          }, {passive:true});
+        }
+      })();
+
 
       // Live data
       (async function init(){
         await loadInterfaces();
+        bindFilterInput();
         await loadHistory();
         tick();
         setInterval(tick, 1000);
         setInterval(loadInterfaces, 30000);
         setInterval(updatePing, 5000);
         updatePing();
-        const scopeSel = document.getElementById('scopeSel');
-        const reportBtn = document.getElementById('reportBtn');
-        reportBtn.addEventListener('click', ()=> loadPeriod(scopeSel.value));
-        scopeSel.addEventListener('change', ()=> loadPeriod(scopeSel.value));
-        loadPeriod(scopeSel.value);
+
       })();
     });
 
