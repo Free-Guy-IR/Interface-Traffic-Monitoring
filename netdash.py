@@ -105,19 +105,15 @@ BLOCK_PAGE_HTML =r"""
   <title>NetDash - داشبورد ترافیک شبکه</title>
 
   <!-- 1) اول: config مربوط به Tailwind -->
+  <!-- Tailwind via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
-      theme: {
-        extend: {
-          fontFamily: { sans: ['Vazirmatn','Inter','ui-sans-serif','system-ui'] }
-        }
-      }
+      theme: { extend: { fontFamily: { sans: ['Vazirmatn','Inter','ui-sans-serif','system-ui'] } } }
     }
   </script>
 
-  <!-- 2) بعد: خود Tailwind و Chart.js -->
-  <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
   <!-- 3) فقط CSS — بدون JS سرگردان -->
@@ -2225,18 +2221,26 @@ HTML =r"""
 <!doctype html>
 <html lang="fa" dir="ltr">
 <head>
+
+  <script>
+    if (localStorage.getItem('netdash-dark') === '1') {
+      document.documentElement.classList.add('dark');
+    }
+  </script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NetDash - داشبورد ترافیک شبکه</title>
 
-  <!-- Tailwind config باید قبل از خود Tailwind باشد -->
+
+  <!-- Tailwind via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
-      theme: { extend: { fontFamily: { sans: ['Vazirmatn', 'Inter', 'ui-sans-serif', 'system-ui'] } } }
+      theme: { extend: { fontFamily: { sans: ['Vazirmatn','Inter','ui-sans-serif','system-ui'] } } }
     }
   </script>
-  <script src="https://cdn.tailwindcss.com"></script>
+
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
   <style>
