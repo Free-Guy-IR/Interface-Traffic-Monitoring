@@ -2540,9 +2540,6 @@ HTML =r"""
         <button id="portsBtn" class="px-3 py-2 rounded-xl text-sm text-white bg-gradient-to-r from-indigo-500 via-fuchsia-500 to-emerald-500 shadow hover:opacity-90">
           پورت‌ها
         </button>
-
-
-        <select id="statSel" class="px-2 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" title="پنجره آماری"></select>
       </div>
 
 
@@ -3351,9 +3348,10 @@ HTML =r"""
 
 
     window.addEventListener('load', ()=>{
+      // بایند مودال‌ها
       bindShapeModalHandlers();
     
-
+      // اینیت‌های صفحه (اگر قبلاً نداشتی)
       initStatWindowSelector();
       populateFilterIfaces();
       loadInterfaces();
