@@ -2563,17 +2563,14 @@ HTML =r"""
       </div>
     </div>
 
-    <div class="card p-4 bg-white dark:bg-gray-800 mb-4">
+    <div class="card p-4 bg-white dark:bg-gray-800 mb-4" id="ports-inline-card">
       <div class="flex items-center justify-between mb-2">
-        <h3 class="font-bold">ترافیک زنده بر اساس پورت</h3>
+        <h3 class="font-bold">پینگ زنده</h3>
         <div class="flex items-center gap-2">
-          <button id="ports-reset"
-                  class="text-sm px-3 py-1 rounded-xl bg-red-100 text-red-900 border border-red-300">
-            پاکسازی لاگ
-          </button>
-          <button id="ports-modal-close" class="text-sm opacity-70">✕</button>
         </div>
       </div>
+
+
 
       <div id="ping-chips" class="flex flex-wrap gap-2"></div>
     </div>
@@ -2704,8 +2701,12 @@ HTML =r"""
       <div class="w-full max-w-3xl card bg-white dark:bg-gray-800 p-4 rounded-xl">
         <div class="flex items-center justify-between mb-2">
           <h3 class="font-bold">ترافیک زنده بر اساس پورت</h3>
-          <button id="ports-modal-close" class="text-sm opacity-70">✕</button>
-
+          <div class="flex items-center gap-2">
+            <button id="ports-reset-modal" class="text-sm px-3 py-1 rounded-xl bg-red-100 text-red-900 border border-red-300">
+              پاکسازی لاگ
+            </button>
+            <button id="ports-modal-close" class="text-sm opacity-70">✕</button>
+          </div>
         </div>
         <div class="text-xs opacity-70 mb-3">منبع داده: conntrack (kernel)</div>
         <div class="overflow-auto max-h-[70vh]">
@@ -2964,21 +2965,28 @@ HTML =r"""
       const openBtn  = document.getElementById('portsBtn');
       const closeBtn = document.getElementById('ports-modal-close');
       const overlay  = document.getElementById('ports-overlay');
+    
       if (openBtn)  openBtn.onclick  = openPortsModal;
       if (closeBtn) closeBtn.onclick = closePortsModal;
       if (overlay)  overlay.onclick  = closePortsModal;
     
-      const resetBtn = document.getElementById('ports-reset');
+      // فقط دکمهٔ ریست داخل مودال:
+      const resetBtn = document.getElementById('ports-reset-modal');
       if (resetBtn) resetBtn.onclick = async ()=>{
-        if(!confirm('لاگ پورت‌ها صفر شود؟')) return;
+        if(!confirm('لاگ پورت‌ها (دانلود کل/آپلود کل) صفر شود؟')) return;
         const headers = CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {};
         try{
           const res = await fetch('/api/ports/reset', { method:'POST', headers });
           if(!res.ok){ alert('ریست نشد'); return; }
-          refreshPorts();
-        }catch(e){ alert('خطا: '+e); }
+          // جدول پورت‌ها را فوری تازه کن
+          if (typeof refreshPorts==='function') refreshPorts();
+        }catch(e){
+          alert('خطا: ' + e);
+        }
       };
     }
+
+
     
 
         
@@ -3285,6 +3293,7 @@ HTML =r"""
     window.addEventListener('load', ()=>{
       bindShapeModalHandlers();
       bindPortsModalHandlers();
+
       bindTotalsReset();
       initStatWindowSelector();
       populateFilterIfaces();
@@ -3325,8 +3334,6 @@ HTML =r"""
       const portsBtn = document.getElementById('portsBtn');
       if (portsBtn) portsBtn.addEventListener('click', openPortsModal, {passive:true});
       
-      const portsClose = document.getElementById('ports-close');
-      if (portsClose) portsClose.addEventListener('click', closePortsModal, {passive:true});
 
 
       // Live data
@@ -3346,7 +3353,6 @@ HTML =r"""
     window.addEventListener('load', ()=>{
       // بایند مودال‌ها
       bindShapeModalHandlers();
-      bindPortsModalHandlers();
     
       // اینیت‌های صفحه (اگر قبلاً نداشتی)
       initStatWindowSelector();
@@ -3356,6 +3362,7 @@ HTML =r"""
       updatePing();
       setInterval(tick, 1000);
     });
+
 
 
 
