@@ -78,6 +78,8 @@ PORTS_MONITOR_ENABLED = os.environ.get("NETDASH_PORTS_MONITOR","1").lower() in (
 PORTS_POLL_INTERVAL  = float(os.environ.get("NETDASH_PORTS_INTERVAL","1.0"))
 
 
+SNI_LOG_ROTATE_ENABLED = os.environ.get("NETDASH_SNI_LOG_ROTATE", "1").lower() in ("1","true","yes","on")
+SNI_LOG_ROTATE_INTERVAL = int(os.environ.get("NETDASH_SNI_LOG_INTERVAL", "3600"))  # ثانیه؛ پیش‌فرض ۱ ساعت
 
 
 
@@ -243,6 +245,37 @@ def _append_sni_log (kind ,host ,dst_ip ,fam =None ,base =None ,iface =None ):
                 f .write (line +"\n")
     except Exception as e :
         print ("[netdash] SNI log error:",e )
+
+
+def _sni_log_truncate():
+    """هر SNI_LOG_ROTATE_INTERVAL ثانیه، فایل sni-seen.log را خالی می‌کند."""
+    while True:
+        try:
+            time.sleep(max(60, SNI_LOG_ROTATE_INTERVAL))  # حداقل هر ۶۰ثانیه
+            if not SNI_LOG_ROTATE_ENABLED:
+                continue
+            # با همان لاکِ نوشتن به لاگ، فایل را امن خالی کن
+            with _SNI_LOG_LOCK:
+                try:
+                    # اگر نبود، مشکلی نیست
+                    os.makedirs(os.path.dirname(SNI_LOG_FILE), exist_ok=True)
+                    with open(SNI_LOG_FILE, "w", encoding="utf-8"):
+                        pass  # فقط truncate
+                except FileNotFoundError:
+                    pass
+        except Exception as e:
+            print("[netdash] SNI log truncate warn:", e)
+
+def start_sni_log_housekeeper():
+    if getattr(start_sni_log_housekeeper, "_started", False):
+        return
+    start_sni_log_housekeeper._started = True
+    if not SNI_LOG_ROTATE_ENABLED:
+        return
+    t = threading.Thread(target=_sni_log_truncate, daemon=True)
+    t.start()
+
+
 
 def _run_ip_json (args ):
     ipbin =_find_ip_binary ()
@@ -862,6 +895,7 @@ class NetMonitor :
 monitor =NetMonitor (POLL_INTERVAL )
 monitor.start()
 
+start_sni_log_housekeeper()
 
 def _find_ip_binary ():
     for p in ("/usr/sbin/ip","/sbin/ip","/usr/bin/ip","ip"):
