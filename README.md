@@ -1,326 +1,154 @@
-# Interface-Traffic-Monitoring
+<div align="center">
+  <strong><a href="README-EN.md">English</a></strong> | <strong><a href="README.md">فارسی</a></strong> | <strong><a href="README-CH.md">中文</a></strong>
+</div>
+<br>
 
-مانیتورینگ ترافیک اینترفیس
-<img width="1256" height="616" alt="Screenshot (165)" src="https://github.com/user-attachments/assets/0ed26721-bd57-4613-926d-9666bbc4a912" />
+# NetDash — داشبورد مانیتورینگ و کنترل ترافیک شبکه
 
-
-
-
-# مانیتورینگ ترافیک اینترفیس  
-نرخ‌ها از `/sys/class/net/*/statistics` و اطلاعات پایه از `ip -json` خوانده می‌شوند.  
-UI شامل کارت جدا برای هر اینترفیس، نمودار زنده، **Dark Mode** و جستجوی سریع است.
-
+یک پنل سبک، بدون دیتابیس و تمام‌خودکار برای **مشاهدهٔ زنده‌ی ترافیک شبکه، محدودسازی پهنای‌باند، مسدودسازی دامنه/IP، مانیتور پینگ** و خیلی چیزهای دیگر. مناسب برای **سرورهای VPN، روترهای خانگی/سازمانی، دفاتر و تیم‌های کوچک**.
 
 ---
 
 ## ✨ قابلیت‌ها
 
-داشبورد لحظه‌ای اینترفیس‌ها با نمودار زنده
+- **داشبورد لحظه‌ای شبکه:** نمایش نرخ دانلود/آپلود هر اینترفیس + نمودارهای زنده
+- **مسدودسازی دامنه/IP/CIDR:** با یک کلیک؛ همراه **صفحهٔ هشدار کاربر** (HTTP 451) در حالت Page Mode
+- **محدودیت سرعت (Shaping):** اعمال سقف سرعت آپلود/دانلود برای هر اینترفیس از داخل پنل
+- **گزارش‌های روزانه/ماهانه:** حجم مصرفی تفکیک‌شده به تفکیک اینترفیس (Traffic usage)
+- **کنترل اینترفیس‌ها:** روشن/خاموش‌کردن کارت شبکه از داخل پنل
+- **پایش پینگ و کیفیت اینترنت:** محاسبهٔ میانگین، بیشینه، پرسنـتایل ۹۵٪ و نرخ Packet Loss
+- **نمایش ترافیک زنده بر اساس پورت:** از طریق conntrack (کرنل)
+- **رابط فارسی + مد تیره/روشن، موبایل‌فرندلی**
+- **بازسازی خودکار قوانین بعد از ری‌استارت** (iptables/ipset/dnsmasq)
+- **بدون دیتابیس**، نصب ساده روی لینوکس
 
-پایش پینگ چند هدف + میانگین/۹۵٪/تلفات
+---
 
-ترافیک زنده بر اساس پورت (conntrack) + پاکسازی لاگ
+## 🚀 نصب سریع (یک‌خطی)
 
-مسدودسازی دامنه/IP/CIDR با ipset/dnsmasq
+اسکریپت نصب تمام پیش‌نیازها را آماده، سرویس‌ها را تنظیم و برنامه را اجرا می‌کند:
 
-یادگیری خودکار SNI و افزودن IPهای جدید به بلاک‌لیست
-
-حالت «صفحهٔ مسدودسازی» HTTP با سرور داخلی
-
-بلاک‌لیست سراسری یا مخصوص هر اینترفیس
-
-محدودیت پهنای‌باند آپلود/دانلود (tc) از داخل پنل
-
-گزارش مصرف روزانه/ماهانه + مجموع‌های تجمعی
-
-کنترل اینترفیس‌ها (روشن/خاموش) از داخل پنل
-
-رابط فارسی، تیره/روشن، واکنش‌گرا (Tailwind)
-
-سبک و بی‌نیاز از دیتابیس؛ 
-
-گزینه‌های اختیاری: اجبار DNS داخلی، مسدودسازی DoT/DoQ، همگام‌سازی خودکار ipset
-
-
-
-  
-
-
-
-### الزامی
-- Linux (تست‌شده روی **Ubuntu 22.04+**)
-- **Python 3.10+** و `pip`
-- **iproute2** (`ip`, `tc`)
-- **iptables** و **ip6tables**
-- **ipset**
-- **conntrack-tools** (`conntrack`)
-- **dnsmasq** (برای حالت ipset/dnsmasq)
-- **ethtool**
-- دسترسی **root** یا `sudo` بدون پسورد برای دستورات سیستمی
-- **Flask** (از مخزن Ubuntu یا PyPI)
-
-### نصب سریع (Ubuntu/Debian)
 ```bash
-sudo apt-get update
-sudo apt-get install -y   python3 python3-pip python3-flask   iproute2 iptables ipset conntrack dnsmasq ethtool dnsutils
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/Interface-Traffic-Monitoring/main/netdash-install.sh)
 ```
 
-> اگر قبلاً با `pip` نسخه‌های ناسازگار Flask/Werkzeug نصب کرده‌اید و خطا می‌بینید، یا فقط از بسته‌های `apt` استفاده کنید، یا پکیج‌های قدیمی `pip` را پاک کرده و یک مجموعهٔ سازگار نصب کنید.
+> اسکریپت در صورت نیاز **systemd-resolved** را غیرفعال و `/etc/resolv.conf` را به `127.0.0.1` تنظیم می‌کند و `dnsmasq` را راه‌اندازی می‌کند. قوانین فایروال توسط خود برنامه مدیریت می‌شود.
 
-- `publicsuffix2` یا `tldextract` (تشخیص دامنهٔ ثبت‌پذیر)
-- `scapy` برای **SNI learner** (اگر `AUTO_PIP_INSTALL=1` باشد خودش نصب می‌شود)
-```bash
-python3 -m pip install --upgrade publicsuffix2 || python3 -m pip install --upgrade tldextract
+پس از نصب، پنل روی این آدرس در دسترس است:
 
-# فقط اگر SNI learner می‌خواهید:
-python3 -m pip install --upgrade scapy
+```
+http://SERVER_IP:18080/
 ```
 
 ---
 
-## ⚙️ آماده‌سازی سیستم (خیلی مهم)
-
-برای اینکه مسدودسازی/ipset و محدودیت پهنای‌باند درست کار کند، چند سرویس/تنظیم را یک‌بار انجام دهید:
-
-### 1) آزاد کردن پورت 53 برای `dnsmasq`
-یکی از این دو روش را انتخاب کنید:
-
-**روش A (پیشنهادی): غیرفعال کردن Stub در `systemd-resolved`**
-```bash
-sudo sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
-sudo systemctl restart systemd-resolved
-echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
-sudo systemctl enable --now dnsmasq
-```
-
-**روش B: غیرفعال کردن کامل `systemd-resolved`**
-```bash
-sudo systemctl disable --now systemd-resolved
-echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
-sudo systemctl enable --now dnsmasq
-```
-
-> اگر سرویس دیگری مثل `dnscrypt-proxy` یا `stubby` پورت 53 را گرفته است، آن را متوقف/غیرفعال کنید.
-
-
-
-
-## 🚀 اجرا (Quick Start)
-پیش‌فرض فایل برنامه `netdash.py` است (روی پورت `18080`).
-
-
-```bash
-python3 /path/to/netdash.py
-# سپس در مرورگر:
-# http://<SERVER-IP>:18080
-```
-
-اگر پورت اشغال بود، پورت را داخل فایل تغییر دهید:
-```bash
-sed -i 's/^PORT\s*=.*/PORT = 18181/' /path/to/netdash.py
-```
-
-اگر فایروال دارید:
-```bash
-sudo ufw allow 18080/tcp
-```
+## 🔧 منوی مدیریت (اسکریپت)
+اسکریپت نصب یک منوی متنی ارائه می‌کند:
+1. **Install / Reinstall** – پیش‌نیازها + دانلود کد + ساخت سرویس systemd
+2. **Update from GitHub** – بروز‌رسانی سورس برنامه
+3. **Edit .env** – ویرایش تنظیمات محیطی در `/etc/netdash.env`
+4. **View Live Logs** – مشاهدهٔ لاگ زندهٔ سرویس
+5. **Stop** / **6. Start** – مدیریت سرویس
+7. **Remove Completely** – حذف کامل سرویس و فایل‌ها
+8. **Status** – وضعیت سرویس
 
 ---
 
-## 🔧 پیکربندی
-- **PORT**: در بالای فایل `netdash.py` مقدار `PORT` را تغییر دهید (پیش‌فرض 18080).
-- **MAX_POINTS**: تعداد نقاط نگهداری‌شده در نمودار و Persist (پیش‌فرض 120). برای حدود ۱ ساعت نمونه‌برداری ۱ ثانیه‌ای، مقدار 3600 مناسب است.
-- **Cache-Control**: برای جلوگیری از کش قدیمی UI، هدر `no-store` روی HTML ست شده است.
-- **CDNها**: Tailwind و Chart.js از CDN لود می‌شوند؛ در صورت نبود اینترنت، می‌توانید نسخه‌های محلی را جایگزین کنید (fallback سادهٔ نمودار فعال است).
+## ⚙️ تنظیمات محیطی (ENV)
+
+فایل تنظیمات در مسیر `/etc/netdash.env` ذخیره می‌شود. مهم‌ترین متغیرها:
+
+| متغیر | پیش‌فرض | توضیح |
+|---|---|---|
+| `NETDASH_PORT` | `18080` | پورت پنل وب |
+| `NETDASH_BLOCK_PORT` | `18081` | پورت صفحهٔ هشدار HTTP |
+| `NETDASH_TOKEN` | خالی | اگر ست شود، باید هدر `X-Auth-Token` برای عملیات مدیریتی ارسال شود |
+| `NETDASH_MAX_POINTS` | `120` | حداکثر نقاط هر نمودار |
+| `NETDASH_IPSET_MODE` | `1` | استفاده از `dnsmasq + ipset` برای بلاک دامنه‌ها |
+| `NETDASH_SNI_BLOCK` | `1` | افزودن قوانین SNI برای TLS/443 |
+| `NETDASH_PAGE_MODE` | `1` | ریدایرکت HTTP به صفحهٔ مسدودسازی (پورت Block) |
+| `NETDASH_SNI_LEARN` | `1` | یادگیری IPهای مقصد از SNI و افزودن به ipset |
+| `NETDASH_SNI_IFACES` | خالی | لیست اینترفیس‌ها برای SNI Learner، جدا با کاما (اختیاری) |
+| `NETDASH_ENFORCE_DNS` | `1` | ریدایرکت DNS کلاینت‌ها به DNS لوکال (iptables nat) |
+| `NETDASH_BLOCK_DOT` | `0` | بلاک DoT/DoQ (پورت‌های 853/TCP و 8853/UDP) |
+| `NETDASH_PRELOAD_META` | `0` | پیش‌بارگذاری چند دامنهٔ پیش‌فرض برای بلاک |
+| `NETDASH_AUTO_PIP` | `1` | نصب خودکار `scapy` در صورت نیاز |
+| `NETDASH_PORTS_MONITOR` | `1` | فعال‌سازی مانیتور پورت‌ها (conntrack) |
+| `NETDASH_PORTS_INTERVAL` | `1.0` | بازهٔ نمونه‌برداری مانیتور پورت‌ها (ثانیه) |
+| `NETDASH_PING_TARGETS` | `1.1.1.1,8.8.8.8,9.9.9.9` | لیست مقصدهای پینگ |
+| `NETDASH_PING_INTERVAL` | `5.0` | فاصلهٔ پینگ‌ها (ثانیه) |
+| `NETDASH_PING_WINDOW` | `50` | اندازهٔ پنجرهٔ محاسبهٔ آمار پینگ |
+
+> فهرست کامل متغیرها در کد منبع `netdash.py` موجود است.
 
 ---
 
-## 💾 محل ذخیره‌سازی داده‌ها (Persist)
+## 🗂️ فایل‌ها و پِرسیستنس
 
-برنامه به‌صورت خودکار یک مسیر «خانهٔ داده» (DATA_HOME) را به‌ترتیب زیر انتخاب می‌کند و همهٔ فایل‌هایش را آن‌جا می‌گذارد:
-1) `/var/lib/netdash/`  ← اگر دسترسی داشته باشید  
-2) `~/.local/share/netdash/`  
-3) `/tmp/netdash/`  
-4) دایرکتوری جاری (Current Working Directory)
+NetDash یک مسیر داده را به‌ترتیب اولویت انتخاب می‌کند (اولین مسیر قابل‌نوشتن):
+1. `/var/lib/netdash/`
+2. `~/.local/share/netdash/`
+3. `/tmp/netdash/`
 
-### فایل‌هایی که ساخته می‌شوند
-> مسیر همهٔ فایل‌های زیر داخل DATA_HOME است (جز مورد مشخص‌شده).
+فایل‌های داده‌ای در این مسیر ایجاد می‌شوند:
+- `history.json` — تاریخچهٔ لحظه‌ای نرخ دانلود/آپلود (برای نمودارها)
+- `totals.json` — مجموع ترافیک هر اینترفیس + آخرین شمارنده‌های سیستمی
+- `period_totals.json` — تجمیع روزانه/ماهانهٔ دانلود/آپلود به تفکیک اینترفیس
+- `filters.json` — اقلام بلاک‌لیست و وضعیت اعمال‌شده آن‌ها
+- `blocks_registry.json` — ایندکس جانبی برای نمایش/بازسازی بلوک‌ها
+- `sni-seen.log` — لاگ رویدادهای SNI مشاهده‌شده
+- `sni-index.json` — ایندکس دامنه→IPهای مشاهده‌شده (برای preseed)
+- `ports_totals.json` — مجموع دانلود/آپلود بر اساس پورت (conntrack)
 
-- `history.json` — تاریخچهٔ لحظه‌ای نرخ دانلود/آپلود هر اینترفیس برای رسم نمودار زنده و بارگذاری مجدد بعد از ری‌استارت.
-- `totals.json` — شمارنده‌های تجمیعی هر اینترفیس (دانلود/آپلود کل) به‌همراه آخرین مقادیر خوانده‌شده از کرنل برای ادامهٔ دقیق بعد از ری‌استارت.
-- `period_totals.json` — مصرف روزانه و ماهانهٔ ترافیک (Per‑Interface) که برای گزارش‌های Daily/Monthly استفاده می‌شود.
-- `filters.json` — تنظیمات بلاک‌لیست (دامنه/IP/CIDR، اینترفیس هدف، پورت/پروتکل، حالت صفحهٔ مسدودسازی، و IPهای «realized»).
-- `blocks_registry.json` — رجیستری کمکی برای UI/دیباگ که وضعیت قواعد و IPهای کشف‌شده را نگه می‌دارد.
-- `sni-index.json` — ایندکس دامنه‌ها به IPها که از «SNI Learner» و Resolve های دوره‌ای پر می‌شود (برای پری‌سید کردن ipsetها).
-- `sni-seen.log` — لاگ متنی افزایشی از SNIهای دیده‌شده (هر خط یک JSON). **حساسیت حریم‌خصوصی** دارد؛ اگر لازم ندارید، نگه‌داری/اشتراک‌گذاری نکنید.
-- `ports_totals.json` — مجموع دانلود/آپلود به تفکیک `(proto, port)` جهت ستون‌های «دانلود کل/آپلود کل» در صفحهٔ «ترافیک زنده بر اساس پورت». با API `/api/ports/reset` صفر می‌شود.
-
-- 
-## 🧪 APIهای سادهٔ تست
-```bash
-# نرخ‌های زنده
-curl -s http://127.0.0.1:18080/api/live | jq .
-
-# اطلاعات اینترفیس‌ها
-curl -s http://127.0.0.1:18080/api/interfaces | jq .
-
-# تاریخچهٔ Persist شده
-curl -s http://127.0.0.1:18080/api/history | jq .
-```
+همچنین فایل پیکربندی dnsmasq در مسیر زیر ساخته/بازسازی می‌شود:
+- `/etc/dnsmasq.d/netdash-blocks.conf` — اتصال دامنه‌ها به ipsetها
 
 ---
 
-## 📦 اجرای مداوم به‌صورت سرویس (systemd)
-
-### گزینه A) سریع و فوری (run as root)
-فایل سرویس زیر را بسازید:
-```bash
-sudo tee /etc/systemd/system/netdash.service >/dev/null <<'UNIT'
-[Unit]
-Description=Network Interface Traffic Monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /root/netdash.py
-WorkingDirectory=/root
-Restart=always
-RestartSec=3
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-```
-
-فعال‌سازی و اجرا:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now netdash
-```
-
-وضعیت و لاگ:
-```bash
-systemctl status netdash
-journalctl -u netdash -e -f
-```
-
-### گزینه B) تمیزتر/ایمن‌تر (کاربر جداگانه `netdash`)
-ایجاد کاربر و مسیرها:
-```bash
-sudo useradd -r -s /usr/sbin/nologin netdash || true
-sudo install -d -o netdash -g netdash /opt/netdash
-sudo install -d -o netdash -g netdash /var/lib/netdash
-sudo cp /root/netdash.py /opt/netdash/netdash.py
-sudo chown netdash:netdash /opt/netdash/netdash.py
-```
-
-سرویس:
-```bash
-sudo tee /etc/systemd/system/netdash.service >/dev/null <<'UNIT'
-[Unit]
-Description=Network Interface Traffic Monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=netdash
-Group=netdash
-WorkingDirectory=/opt/netdash
-PermissionsStartOnly=true
-ExecStartPre=/usr/bin/mkdir -p /var/lib/netdash
-ExecStartPre=/usr/bin/chown -R netdash:netdash /var/lib/netdash
-ExecStart=/usr/bin/python3 /opt/netdash/netdash.py
-Restart=always
-RestartSec=3
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now netdash
-```
+## 🔐 نکات امنیتی
+- برای درخواست‌های تغییردهنده (افزودن/حذف فیلترها، اعمال محدودیت و…)، **توکن** تنظیم کنید و از هدر `X-Auth-Token: <TOKEN>` استفاده کنید.
+- پنل را پشت فایروال یا فقط روی لوکال‌نت در دسترس بگذارید و در صورت نیاز **Reverse Proxy + TLS** قرار دهید.
 
 ---
 
-## 🛡️ اجرای Production-Grade (اختیاری)
+## 🧰 دستورات سرویس
 
-### Gunicorn
 ```bash
-sudo apt-get install -y gunicorn
-sudo tee /etc/systemd/system/netdash.service >/dev/null <<'UNIT'
-[Unit]
-Description=Network Interface Traffic Monitor (gunicorn)
-After=network-online.target
-Wants=network-online.target
+# وضعیت/لاگ
+sudo systemctl status netdash
+sudo journalctl -u netdash -f
 
-[Service]
-Type=simple
-WorkingDirectory=/root
-ExecStart=/usr/bin/gunicorn --bind 0.0.0.0:18080 --workers 2 --threads 4 netdash:app
-Restart=always
-RestartSec=3
-Environment=PYTHONUNBUFFERED=1
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-sudo systemctl daemon-reload
+# شروع/توقف/ری‌استارت
+sudo systemctl start netdash
+sudo systemctl stop netdash
 sudo systemctl restart netdash
 ```
 
-> اگر فایل را به `/opt/netdash/netdash.py` منتقل کرده‌اید، `WorkingDirectory` را مطابق مسیر جدید تنظیم کنید.
-
-### Nginx (ریورس‌پروکسی + دامنه/SSL) — خلاصه
-```bash
-sudo apt-get install -y nginx
-sudo tee /etc/nginx/sites-available/netdash >/dev/null <<'NG'
-server {
-    listen 80;
-    server_name YOUR_DOMAIN;
-
-    location / {
-        proxy_pass         http://127.0.0.1:18080;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
-}
-NG
-sudo ln -sf /etc/nginx/sites-available/netdash /etc/nginx/sites-enabled/netdash
-sudo nginx -t && sudo systemctl reload nginx
-```
-
 ---
 
-## ❓ رفع اشکال‌های رایج
-- **Address already in use**: پورت را عوض کنید یا پروسهٔ اشغال‌کننده را متوقف کنید:
+## 🩺 عیب‌یابی
+
+- **dnsmasq روی پورت 53 بالا نمی‌آید (port in use):**‌
   ```bash
-  sudo ss -lntp '( sport = :18080 )'
-  sudo fuser -vk 18080/tcp
+  sudo systemctl disable --now systemd-resolved
+  echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
+  sudo systemctl enable --now dnsmasq
+  sudo systemctl restart dnsmasq && systemctl status dnsmasq
   ```
-- **ImportError مربوط به Flask/itsdangerous/Werkzeug**: از بسته‌های `apt` استفاده کنید یا مجموعهٔ نسخه‌های `pip` را یکدست کنید.
-- **UI کش قدیمی**: یک بار Hard Refresh (Ctrl+F5) بزنید.
-- **`iproute2` نصب نیست**:
-  ```bash
-  sudo apt-get install -y iproute2
-  ```
+- **قوانین iptables اعمال نمی‌شود:** مطمئن شوید کاربر اجازهٔ sudo بدون پسورد برای دستورات شبکه را دارد یا برنامه را با کاربر روت اجرا کنید.
+- **لاگ سرویس را ببینید:** `journalctl -u netdash -f`
+- **پورت پنل باز نیست:** فایروال سیستم یا Cloud/Provider را بررسی کنید (پورت پیش‌فرض 18080).
 
 ---
 
+## 👨‍💻 توسعه
+
+- کد اصلی: [`netdash.py`](https://github.com/Free-Guy-IR/Interface-Traffic-Monitoring/blob/main/netdash.py)
+- اسکریپت نصب: [`netdash-install.sh`](https://github.com/Free-Guy-IR/Interface-Traffic-Monitoring/blob/main/netdash-install.sh)
+
+پیشنهاد/باگ‌ریپورت‌ها را در Issues ثبت کنید 🌟
 
 ---
 
-## 🏷️ نام پروژه
-**مانیتورینگ ترافیک اینترفیس**  
-نام انگلیسی: **Network Interface Traffic Monitor** (*NetDash*)
-
+## 💖 حمایت
+اگر NetDash برایتان مفید بود، لطفاً با ⭐️ دادن به مخزن از پروژه حمایت کنید.
