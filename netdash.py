@@ -3351,10 +3351,9 @@ HTML =r"""
 
 
     window.addEventListener('load', ()=>{
-      // بایند مودال‌ها
       bindShapeModalHandlers();
     
-      // اینیت‌های صفحه (اگر قبلاً نداشتی)
+
       initStatWindowSelector();
       populateFilterIfaces();
       loadInterfaces();
