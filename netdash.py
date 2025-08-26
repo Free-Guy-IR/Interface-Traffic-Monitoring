@@ -52,7 +52,6 @@ HOST ="0.0.0.0"
 PORT =int (os .environ .get ("NETDASH_PORT","18080"))
 BLOCK_PORT =int (os .environ .get ("NETDASH_BLOCK_PORT","18081"))
 FLUSH_SETS_ON_REMOVE =os .environ .get ("NETDASH_FLUSH_SETS_ON_REMOVE","1").lower ()in ("1","true","yes","on")
-ENABLE_PAGE_MODE =os .environ .get ("NETDASH_ENABLE_PAGE_MODE","0").lower ()in ("1","true","yes","on")
 USE_DNSMASQ_IPSET =os .environ .get ("NETDASH_IPSET_MODE","1").lower ()in ("1","true","yes","on")
 SNI_BLOCK_ENABLED =os .environ .get ("NETDASH_SNI_BLOCK","1").lower ()in ("1","true","yes","on")
 PAGE_MODE_ENABLED =os .environ .get ("NETDASH_PAGE_MODE","1").lower ()in ("1","true","yes","on")
@@ -77,6 +76,7 @@ DNSMASQ_CONF =os .environ .get ("NETDASH_DNSMASQ_CONF","/etc/dnsmasq.d/netdash-b
 
 PORTS_MONITOR_ENABLED = os.environ.get("NETDASH_PORTS_MONITOR","1").lower() in ("1","true","yes","on")
 PORTS_POLL_INTERVAL  = float(os.environ.get("NETDASH_PORTS_INTERVAL","1.0"))
+
 
 
 
@@ -209,6 +209,7 @@ def _pick_data_home ():
     return os .getcwd ()
 
 DATA_HOME =_pick_data_home ()
+PORTS_TOTALS_FILE = os.path.join(DATA_HOME, "ports_totals.json")
 SNI_LOG_FILE =os .path .join (DATA_HOME ,"sni-seen.log")
 SNI_INDEX_FILE =os .path .join (DATA_HOME ,"sni-index.json")
 SNI_INDEX_PRESEED_ON_ADD =True 
@@ -599,6 +600,27 @@ class TotalsStore :
             self .ifaces [name ]=rec 
             return rec ["rx_total"],rec ["tx_total"]
 
+    def reset(self, iface=None):
+        with self.lock:
+            if iface:
+                rx, tx = read_counters(iface)
+                self.ifaces[iface] = {
+                    "rx_total": 0.0, "tx_total": 0.0,
+                    "last_rx": int(rx), "last_tx": int(tx),
+                    "t": time.time(),
+                }
+            else:
+                for name in list_ifaces_fs():
+                    rx, tx = read_counters(name)
+                    self.ifaces[name] = {
+                        "rx_total": 0.0, "tx_total": 0.0,
+                        "last_rx": int(rx), "last_tx": int(tx),
+                        "t": time.time(),
+                    }
+        self.flush(force=True)
+
+
+
 totals =TotalsStore (TOTALS_FILE )
 
 class PeriodStore :
@@ -838,6 +860,8 @@ class NetMonitor :
             return {"ts":time .time (),"rates":dict (self .data )}
 
 monitor =NetMonitor (POLL_INTERVAL )
+monitor.start()
+
 
 def _find_ip_binary ():
     for p in ("/usr/sbin/ip","/sbin/ip","/usr/bin/ip","ip"):
@@ -967,57 +991,104 @@ def _conntrack_lines():
 
 
 class PortsMonitor:
-    """
-    جمع‌آوری از conntrack و تجمیع بر اساس (proto, dport)
-    rx_bps: reply bytes/sec ~ دانلود | tx_bps: orig bytes/sec ~ آپلود
-    """
     def __init__(self, interval=1.0, max_ports=1000):
         self.interval = float(interval)
-        self.prev_flows = {}  # (proto,src,sport,dst,dport) -> (orig_bytes, reply_bytes, t)
+        self.prev_flows = {}
         self.totals = {}      # (proto,port) -> {"rx_total":int, "tx_total":int}
-        self.rates  = {}      # (proto,port) -> {"rx_bps":float,"tx_bps":float,"flows":int}
+        self.rates  = {}
         self.lock = threading.Lock()
         self.running = False
         self.max_ports = max_ports
+        # persist
+        self.totals_file = PORTS_TOTALS_FILE
+        self._last_flush = 0.0
+        self.flush_interval = 5.0
+        self._load_totals()   # ← مجموع‌های قبلی را از دیسک برگردان
+
+    def _key_to_str(self, proto, port):
+        return f"{proto}:{int(port)}"
+
+    def _str_to_key(self, s):
+        proto, p = s.split(":", 1)
+        return (proto, int(p))
+
+    def _load_totals(self):
+        try:
+            with open(self.totals_file, "r", encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            tots = {}
+            for k, v in raw.items():
+                proto, port = self._str_to_key(k)
+                tots[(proto, port)] = {
+                    "rx_total": int(v.get("rx_total", 0)),
+                    "tx_total": int(v.get("tx_total", 0)),
+                }
+            with self.lock:
+                self.totals = tots
+        except Exception:
+            pass
 
     def _parse(self, line):
+        """
+        خروجی نمونه conntrack -L -o extended:
+        tcp      6 431999 ESTABLISHED src=10.0.0.2 dst=1.2.3.4 sport=51234 dport=443 packets=12 bytes=3456 ...
+                                        src=1.2.3.4 dst=10.0.0.2 sport=443   dport=51234 packets=10 bytes=7890 ...
+        """
         try:
-            parts = line.strip().split()
-            if not parts: return None
-            proto = parts[0].lower()
-            orig = {"src":None,"dst":None,"sport":None,"dport":None}
-            reply= {"src":None,"dst":None,"sport":None,"dport":None}
-            stage="orig"; need={"src","dst","sport","dport"}; have=set()
-            i=1
-            while i<len(parts):
-                tok=parts[i]
-                if tok.startswith("src="):
-                    (orig if stage=="orig" else reply)["src"]=tok[4:]; have.add("src")
-                elif tok.startswith("dst="):
-                    (orig if stage=="orig" else reply)["dst"]=tok[4:]; have.add("dst")
-                elif tok.startswith("sport="):
-                    (orig if stage=="orig" else reply)["sport"]=tok[6:]; have.add("sport")
-                elif tok.startswith("dport="):
-                    (orig if stage=="orig" else reply)["dport"]=tok[6:]; have.add("dport")
-                    if stage=="orig" and have>=need:
-                        stage="reply"; have=set()
-                i+=1
-            ob = rb = None; seen=0
-            for tok in parts:
-                if tok.startswith("bytes="):
-                    v=int(tok.split("=",1)[1])
-                    if seen==0: ob=v
-                    elif seen==1: rb=v
-                    seen+=1
-            if not orig["dport"]: return None
-            dport = int(orig["dport"])
-            if ob is None: ob=0
-            if rb is None: rb=0
-            flow_key=(proto, orig["src"], orig["sport"], orig["dst"], str(dport))
-            port_key=(proto, dport)
-            return flow_key, port_key, ob, rb
+            mproto = re.match(r'^(\w+)\s', line)
+            if not mproto:
+                return None
+            proto = mproto.group(1).lower()
+
+            # dport جریان اصلی
+            mdport = re.search(r'\bdport=(\d+)', line)
+            if not mdport:
+                return None
+            port = int(mdport.group(1))
+
+            # bytes برای orig و reply (اولی orig، دومی reply)
+            bytes_vals = re.findall(r'\bbytes=(\d+)', line)
+            if not bytes_vals:
+                return None
+            ob = int(bytes_vals[0])
+            rb = int(bytes_vals[1]) if len(bytes_vals) > 1 else 0
+
+            # کلید یکتای جریان
+            mflow = re.search(
+                r'src=([0-9a-fA-F:.]+)\s+dst=([0-9a-fA-F:.]+)\s+sport=(\d+)\s+dport=(\d+)',
+                line
+            )
+            if mflow:
+                fkey = (proto, mflow.group(1), mflow.group(2), int(mflow.group(3)), int(mflow.group(4)))
+            else:
+                fkey = (proto, port, ob, rb)  # fallback
+
+            pkey = (proto, port)
+            return (fkey, pkey, ob, rb)
         except Exception:
             return None
+
+
+    def _flush_totals(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_flush) < self.flush_interval:
+            return
+        try:
+            with self.lock:
+                dump = { self._key_to_str(proto, port): vals
+                         for (proto, port), vals in self.totals.items() }
+            tmp = self.totals_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dump, f)
+            os.replace(tmp, self.totals_file)
+            self._last_flush = now
+        except Exception:
+            pass
+
+    def reset_totals(self):
+        with self.lock:
+            self.totals.clear()
+        self._flush_totals(force=True)
 
     def _loop(self):
         while self.running:
@@ -1082,12 +1153,29 @@ if PORTS_MONITOR_ENABLED:
     except Exception as e:
         print("[netdash] ports monitor disabled:", e)
 
-# API route
-# قبلی:
-# @app.route("/api/ports/live")
-# def api_ports_live():
+@app.route("/api/ports/reset", methods=["POST"])
+def api_ports_reset():
+    _require_token()
+    try:
+        portsmon.reset_totals()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-# پیشنهادی (endpoint یکتا + اسم تابع جدید):
+
+@app.route("/api/totals/reset", methods=["POST"])
+def api_totals_reset():
+    _require_token()
+    try:
+        data = request.get_json(silent=True) or {}
+        iface = (data.get("iface") or "").strip() or None
+        totals.reset(iface=iface)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
 @app.route("/api/ports/live", endpoint="ports_live_api")
 def api_ports_live_view():
     if not PORTS_MONITOR_ENABLED:
@@ -2452,7 +2540,8 @@ HTML =r"""
         <button id="portsBtn" class="px-3 py-2 rounded-xl text-sm text-white bg-gradient-to-r from-indigo-500 via-fuchsia-500 to-emerald-500 shadow hover:opacity-90">
           پورت‌ها
         </button>
-      
+
+
         <select id="statSel" class="px-2 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm" title="پنجره آماری"></select>
       </div>
 
@@ -2476,9 +2565,16 @@ HTML =r"""
 
     <div class="card p-4 bg-white dark:bg-gray-800 mb-4">
       <div class="flex items-center justify-between mb-2">
-        <div class="font-semibold">تاخیر و از‌دست‌رفت بسته</div>
-        <div class="text-xs opacity-70">Targets: <span id="ping-targets" class="k"></span></div>
+        <h3 class="font-bold">ترافیک زنده بر اساس پورت</h3>
+        <div class="flex items-center gap-2">
+          <button id="ports-reset"
+                  class="text-sm px-3 py-1 rounded-xl bg-red-100 text-red-900 border border-red-300">
+            پاکسازی لاگ
+          </button>
+          <button id="ports-modal-close" class="text-sm opacity-70">✕</button>
+        </div>
       </div>
+
       <div id="ping-chips" class="flex flex-wrap gap-2"></div>
     </div>
 
@@ -2608,7 +2704,8 @@ HTML =r"""
       <div class="w-full max-w-3xl card bg-white dark:bg-gray-800 p-4 rounded-xl">
         <div class="flex items-center justify-between mb-2">
           <h3 class="font-bold">ترافیک زنده بر اساس پورت</h3>
-          <button id="ports-close" class="text-sm opacity-70">✕</button>
+          <button id="ports-modal-close" class="text-sm opacity-70">✕</button>
+
         </div>
         <div class="text-xs opacity-70 mb-3">منبع داده: conntrack (kernel)</div>
         <div class="overflow-auto max-h-[70vh]">
@@ -2860,15 +2957,31 @@ HTML =r"""
       };
     }
     
+
+    // ---------- API/UI logic ----------
+    
     function bindPortsModalHandlers(){
       const openBtn  = document.getElementById('portsBtn');
-      const closeBtn = document.getElementById('ports-close');
+      const closeBtn = document.getElementById('ports-modal-close');
       const overlay  = document.getElementById('ports-overlay');
       if (openBtn)  openBtn.onclick  = openPortsModal;
       if (closeBtn) closeBtn.onclick = closePortsModal;
       if (overlay)  overlay.onclick  = closePortsModal;
+    
+      const resetBtn = document.getElementById('ports-reset');
+      if (resetBtn) resetBtn.onclick = async ()=>{
+        if(!confirm('لاگ پورت‌ها صفر شود؟')) return;
+        const headers = CONTROL_TOKEN ? {"X-Auth-Token": CONTROL_TOKEN} : {};
+        try{
+          const res = await fetch('/api/ports/reset', { method:'POST', headers });
+          if(!res.ok){ alert('ریست نشد'); return; }
+          refreshPorts();
+        }catch(e){ alert('خطا: '+e); }
+      };
     }
-    // ---------- API/UI logic ----------
+    
+
+        
 
     function initStatWindowSelector(){
       const sel = document.getElementById('statSel');
@@ -3017,7 +3130,8 @@ HTML =r"""
         const wrap = document.getElementById('ping-chips');
         wrap.innerHTML = '';
         const tg = Object.keys(data);
-        document.getElementById('ping-targets').textContent = tg.join(', ');
+        
+        
         for(const [host, m] of Object.entries(data)){
           const chip = document.createElement('div');
           chip.className = 'badge b-up';
@@ -3171,7 +3285,7 @@ HTML =r"""
     window.addEventListener('load', ()=>{
       bindShapeModalHandlers();
       bindPortsModalHandlers();
-    
+      bindTotalsReset();
       initStatWindowSelector();
       populateFilterIfaces();
       loadInterfaces();
