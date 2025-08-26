@@ -44,29 +44,70 @@ UI شامل کارت جدا برای هر اینترفیس، نمودار زند
 
 
   
-- **Dark Mode** و فیلتر/جستجوی سریع نام اینترفیس‌ها
-- **Persist**: آخرین `MAX_POINTS` نمونه برای هر اینترفیس روی دیسک ذخیره می‌شود و بعد از ری‌استارت بازیابی می‌گردد
 
----
 
-## 🧩 پیش‌نیازها
-- Linux (تست‌شده روی Ubuntu 22.04+)
-- Python 3.10+
-- `iproute2` (برای دستور `ip`)
-- Flask (نسخه‌های مخزن Ubuntu هم سازگارند)
 
-نصب سریع (Ubuntu/Debian):
+### الزامی
+- Linux (تست‌شده روی **Ubuntu 22.04+**)
+- **Python 3.10+** و `pip`
+- **iproute2** (`ip`, `tc`)
+- **iptables** و **ip6tables**
+- **ipset**
+- **conntrack-tools** (`conntrack`)
+- **dnsmasq** (برای حالت ipset/dnsmasq)
+- **ethtool**
+- دسترسی **root** یا `sudo` بدون پسورد برای دستورات سیستمی
+- **Flask** (از مخزن Ubuntu یا PyPI)
+
+### نصب سریع (Ubuntu/Debian)
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 python3-flask iproute2
+sudo apt-get install -y   python3 python3-pip python3-flask   iproute2 iptables ipset conntrack dnsmasq ethtool dnsutils
 ```
 
-> اگر قبلاً با `pip` نسخه‌های ناسازگار نصب کرده‌اید و خطاهای `itsdangerous`/`Werkzeug` می‌بینید، یا فقط از بسته‌های `apt` استفاده کنید، یا پکیج‌های `pip` قدیمی را حذف و یک ست سازگار نصب کنید.
+> اگر قبلاً با `pip` نسخه‌های ناسازگار Flask/Werkzeug نصب کرده‌اید و خطا می‌بینید، یا فقط از بسته‌های `apt` استفاده کنید، یا پکیج‌های قدیمی `pip` را پاک کرده و یک مجموعهٔ سازگار نصب کنید.
+
+- `publicsuffix2` یا `tldextract` (تشخیص دامنهٔ ثبت‌پذیر)
+- `scapy` برای **SNI learner** (اگر `AUTO_PIP_INSTALL=1` باشد خودش نصب می‌شود)
+```bash
+python3 -m pip install --upgrade publicsuffix2 || python3 -m pip install --upgrade tldextract
+
+# فقط اگر SNI learner می‌خواهید:
+python3 -m pip install --upgrade scapy
+```
 
 ---
+
+## ⚙️ آماده‌سازی سیستم (خیلی مهم)
+
+برای اینکه مسدودسازی/ipset و محدودیت پهنای‌باند درست کار کند، چند سرویس/تنظیم را یک‌بار انجام دهید:
+
+### 1) آزاد کردن پورت 53 برای `dnsmasq`
+یکی از این دو روش را انتخاب کنید:
+
+**روش A (پیشنهادی): غیرفعال کردن Stub در `systemd-resolved`**
+```bash
+sudo sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
+sudo systemctl restart systemd-resolved
+echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
+sudo systemctl enable --now dnsmasq
+```
+
+**روش B: غیرفعال کردن کامل `systemd-resolved`**
+```bash
+sudo systemctl disable --now systemd-resolved
+echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
+sudo systemctl enable --now dnsmasq
+```
+
+> اگر سرویس دیگری مثل `dnscrypt-proxy` یا `stubby` پورت 53 را گرفته است، آن را متوقف/غیرفعال کنید.
+
+
+
 
 ## 🚀 اجرا (Quick Start)
 پیش‌فرض فایل برنامه `netdash.py` است (روی پورت `18080`).
+
 
 ```bash
 python3 /path/to/netdash.py
